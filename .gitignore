@@ -1,0 +1,44 @@
+# Local runtime data (settings, API keys, proxies, logs, CSV results)
+data/*
+!data/.gitkeep
+
+# Environment variables
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+
+# PyInstaller / build artifacts
+build/
+dist/
+*.spec.bak
+
+# Playwright browser cache (if installed locally in project)
+.playwright/
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Cursor local state
+.cursor/
