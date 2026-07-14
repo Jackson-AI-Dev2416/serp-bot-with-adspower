@@ -9,13 +9,13 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from playwright.sync_api import Browser, Page, sync_playwright
 
 from config.bot_config import BotConfig
-from core.profile_status import ProfileStatus, UiStatusKey
+from core.profile_status import ProfileStatus, UiStatusKey, short_error_detail
 from services.adspower_manager import ProfileSpec
 from services.captcha_solver import CaptchaSolver
 from services.google_consent import dismiss_google_consent, is_google_consent_present, seed_google_consent_cookies
 from services.network_optimizer import NetworkOptimizer, PagePhase, classify_network_error
 from utils.crash_reporter import capture_exception
-from utils.csv_logger import CsvRankLogger, KeywordHistoryLogger
+from utils.csv_logger import CsvRankLogger, KeywordHistoryLogger, SessionClickCsvLogger
 from utils.human import enable_mobile_touch, human_click, human_type, micro_scroll, random_delay, scroll_page, dispatch_touch_tap
 
 StatusCallback = Callable[[ProfileStatus], None]
@@ -23,6 +23,7 @@ UiStatusCallback = Callable[[str, str], None]
 FailureCallback = Callable[[ProfileSpec, str, BaseException], None]
 TrafficCallback = Callable[[int, int], None]
 KeywordExhaustedCallback = Callable[[str], None]
+TargetClickCallback = Callable[[], None]
 
 
 class SerpBot:
@@ -31,6 +32,9 @@ class SerpBot:
     self.logger = logger
     self.captcha = CaptchaSolver(config.capsolver_api_key, logger)
     self.csv = CsvRankLogger("data/results.csv")
+    self._session_click_log: Optional[SessionClickCsvLogger] = None
+    if (config.session_click_log_path or "").strip():
+      self._session_click_log = SessionClickCsvLogger(config.session_click_log_path)
     self.keyword_history = KeywordHistoryLogger(config.target_domain)
     self._last_search_exhausted = False
     self._last_search_exhaustion_eligible = False
@@ -156,14 +160,15 @@ class SerpBot:
     on_traffic: Optional[TrafficCallback] = None,
     on_failure: Optional[FailureCallback] = None,
     on_keyword_exhausted: Optional[KeywordExhaustedCallback] = None,
+    on_target_click: Optional[TargetClickCallback] = None,
     on_session_cleanup: Optional[Callable[[], None]] = None,
   ) -> str:
-    def set_status(status: ProfileStatus) -> None:
-      if on_status:
-        on_status(status)
+    def set_status(status: ProfileStatus, detail: str = "") -> None:
+      key, text = status.to_ui(detail=detail)
       if on_ui_status:
-        key, text = status.to_ui()
         on_ui_status(key, text)
+      elif on_status:
+        on_status(status)
 
     def stopped() -> bool:
       return bool(stop_event and stop_event.is_set())
@@ -171,7 +176,6 @@ class SerpBot:
     def log(msg: str) -> None:
       self.logger(f"[{profile.name}] {msg}")
 
-    set_status(ProfileStatus.RUNNING)
     log("[Session] Starting")
     self.captcha.reset_session_state()
     self.captcha.set_session_logger(log)
@@ -252,10 +256,6 @@ class SerpBot:
           page = self._recover_work_page(page.context, profile, log)
           if work_ref is not None:
             work_ref["page"] = page
-        self._configure_network_optimizer(page, profile, log, network)
-        if work_ref is not None and not work_ref["page"].is_closed():
-          page = work_ref["page"]
-        page.on("response", handle_response)
         if self._is_mobile_profile(profile):
           self._prepare_mobile_session(page, profile, log)
 
@@ -264,15 +264,25 @@ class SerpBot:
 
         self._warm_up_browser_proxy(page, profile, log)
 
-        log("[IP] Checking proxy IP...")
-        session_baseline_ip = self._capture_session_ip(page, log, stopped=stopped)
-        if session_baseline_ip:
-          log(f"[IP] Session baseline IP captured: {session_baseline_ip}")
+        session_baseline_ip = ""
+        if self.config.ip_check_session_start:
+          set_status(ProfileStatus.CHECKING_IP)
+          log("[IP] Checking proxy IP...")
+          session_baseline_ip = self._capture_session_ip(page, log, stopped=stopped)
+          if session_baseline_ip:
+            log(f"[IP] Proxy IP captured: {session_baseline_ip}")
+          else:
+            log(
+              "[IP] Could not capture proxy IP through browser "
+              "(continuing; keyword-2 IP compare will be skipped)."
+            )
         else:
-          log(
-            "[IP] Could not capture session baseline IP "
-            "(continuing; keyword-2 IP compare will be skipped)."
-          )
+          log("[IP] Session-start IP check disabled in settings — skipping.")
+
+        self._configure_network_optimizer(page, profile, log, network)
+        if work_ref is not None and not work_ref["page"].is_closed():
+          page = work_ref["page"]
+        page.on("response", handle_response)
 
         opened_google, page = self._open_url_with_retry(
           page,
@@ -287,7 +297,7 @@ class SerpBot:
           work_ref["page"] = page
         if not opened_google:
           log("[Start] Could not open Google within 45s after IP check.")
-          set_status(ProfileStatus.ERROR)
+          set_status(ProfileStatus.ERROR, detail="Google timeout")
           if self._is_mobile_profile(profile):
             return "error"
           return "tunnel_error"
@@ -336,15 +346,15 @@ class SerpBot:
 
           # Rotating residential proxy policy:
           # - Capture IP once at session start (session_baseline_ip).
-          # - Re-check only before the 2nd keyword; stop if IP changed mid-session.
-          if index == 2 and session_baseline_ip:
+          # - Optional re-check before the 2nd keyword; stop if IP changed mid-session.
+          if self.config.ip_check_enabled and index == 2 and session_baseline_ip:
             current_ip = self._capture_session_ip(page, log, stopped=stopped, attempts=2)
             if current_ip and current_ip.strip() != session_baseline_ip.strip():
               log(
                 f"[IP] Session IP changed before keyword 2 "
                 f"({session_baseline_ip} -> {current_ip}). Stopping profile for deletion."
               )
-              set_status(ProfileStatus.ERROR)
+              set_status(ProfileStatus.ERROR, detail="IP changed")
               return "ip_changed"
             if current_ip:
               log(f"[IP] Session IP unchanged before keyword 2 ({current_ip})")
@@ -465,12 +475,30 @@ class SerpBot:
                 set_status(ProfileStatus.ERROR)
                 return guard
 
+              visited_url = href or ""
+              try:
+                visited_url = (page.url or href or "").strip()
+              except Exception:
+                pass
+
               self.csv.log(keyword, self.config.target_domain, page_num, rank, profile.name)
               total_rank = ((page_num - 1) * 10) + rank
+              if self._session_click_log:
+                self._session_click_log.log(
+                  profile_name=profile.name,
+                  device=profile.device_label,
+                  keyword=keyword,
+                  url=visited_url,
+                  page=page_num,
+                  rank=rank,
+                  overall_rank=total_rank,
+                )
+                if on_target_click:
+                  on_target_click()
               self.keyword_history.log(keyword, page_num, rank, total_rank)
               log(f"Found {self.config.target_domain} at page {page_num}, rank {rank} for '{keyword}'")
               found_any = True
-              set_status(ProfileStatus.SUCCESS)
+              set_status(ProfileStatus.VISITING_SITE)
               dwell_seconds = random.uniform(self.config.dwell_min, self.config.dwell_max)
               log(f"[Target] Dwelling on site for {dwell_seconds:.0f}s")
               self._dwell_on_site(page, dwell_seconds, stopped, profile)
@@ -504,7 +532,6 @@ class SerpBot:
           report_traffic(force=True)
           return "not_found"
 
-        set_status(ProfileStatus.SUCCESS)
         report_traffic(force=True)
         return "success"
       except Exception as exc:
@@ -513,7 +540,7 @@ class SerpBot:
           return "stopped"
         log(f"Session error: {exc}")
         self._report_failure(page, profile, "run_session", exc, on_failure)
-        set_status(ProfileStatus.ERROR)
+        set_status(ProfileStatus.ERROR, detail=short_error_detail(exc, "run_session"))
         error_kind = classify_network_error(exc)
         if error_kind in ("tunnel", "dns"):
           log(f"[Network] {error_kind} error — profile will retry with proxy rotation policy")
@@ -554,21 +581,38 @@ class SerpBot:
     )
 
   def _fetch_public_ip(self, page: Page) -> str:
+    """Resolve egress IP via in-tab fetch (AdsPower proxy), without full navigation."""
     endpoints = (
       "https://api.ipify.org?format=text",
       "https://checkip.amazonaws.com/",
       "https://ipv4.icanhazip.com/",
     )
     for endpoint in endpoints:
-      try:
-        response = page.context.request.get(endpoint, timeout=15000)
-        if not response.ok:
-          continue
-        ip = (response.text() or "").strip()
-        if ip and self._looks_like_ip(ip):
-          return ip
-      except Exception:
-        continue
+      if page.is_closed():
+        return ""
+      ip = self._read_ip_from_browser_tab(page, endpoint)
+      if ip:
+        return ip
+    return ""
+
+  def _read_ip_from_browser_tab(self, page: Page, url: str) -> str:
+    if page.is_closed():
+      return ""
+    try:
+      ip = page.evaluate(
+        """async (endpoint) => {
+          const response = await fetch(endpoint, { cache: 'no-store', credentials: 'omit' });
+          if (!response.ok) return '';
+          const text = (await response.text()).trim();
+          return text.split(/\\s+/)[0] || '';
+        }""",
+        url,
+      )
+      ip = (ip or "").strip()
+      if ip and self._looks_like_ip(ip):
+        return ip
+    except Exception:
+      pass
     return ""
 
   def _capture_session_ip(
@@ -1078,6 +1122,17 @@ class SerpBot:
     if on_failure:
       on_failure(profile, context, exc)
 
+  @staticmethod
+  def _resume_status_for_context(context: str) -> ProfileStatus:
+    lowered = (context or "").lower()
+    if "target" in lowered or "visit" in lowered or "dwell" in lowered:
+      return ProfileStatus.VISITING_SITE
+    if "warmup" in lowered or "startup" in lowered:
+      return ProfileStatus.WARMING_UP
+    if "search" in lowered or "keyword" in lowered or "serp" in lowered or "retry" in lowered:
+      return ProfileStatus.SEARCHING
+    return ProfileStatus.SEARCHING
+
   def _guard_captcha(
     self,
     page: Page,
@@ -1091,16 +1146,20 @@ class SerpBot:
     page = self._sync_work_page(page, profile, log)
 
     def captcha_status(status_key: str, display_text: str) -> None:
-      if status_key == UiStatusKey.CAPTCHA_MANUAL.value:
+      if on_ui_status:
+        on_ui_status(status_key, display_text)
+      elif status_key == UiStatusKey.CAPTCHA_MANUAL.value:
         set_status(ProfileStatus.CAPTCHA_MANUAL)
       else:
         set_status(ProfileStatus.CAPTCHA_WAIT)
-      if on_ui_status:
-        on_ui_status(status_key, display_text)
+
+    def resume_after_captcha() -> None:
+      set_status(SerpBot._resume_status_for_context(context))
 
     def finish_captcha_flow(result: str) -> tuple[str, Page]:
       nonlocal page
       if result == "ok":
+        resume_after_captcha()
         page = self._sync_work_page(page, profile, log)
         log(f"[Captcha] Post-solve page synced ({context}) — locators must be recreated")
       return result, page
@@ -1111,7 +1170,9 @@ class SerpBot:
       if self.captcha.is_awaiting_clear():
         log(f"[Captcha] Check failed during {context}; still waiting for solve: {exc}")
         return finish_captcha_flow(
-          self.captcha.handle_before_action(page, stop_event, captcha_status)
+          self.captcha.handle_before_action(
+            page, stop_event, captcha_status, resume_after_captcha,
+          )
         )
       if self._is_connection_error(exc):
         log(f"[Captcha] Check failed during {context}; retrying: {exc}")
@@ -1129,14 +1190,18 @@ class SerpBot:
 
     try:
       return finish_captcha_flow(
-        self.captcha.handle_before_action(page, stop_event, captcha_status)
+        self.captcha.handle_before_action(
+          page, stop_event, captcha_status, resume_after_captcha,
+        )
       )
     except Exception as exc:
       if self.captcha.is_awaiting_clear() or self._is_connection_error(exc):
         log(f"[Captcha] Solver flow interrupted during {context}; waiting for solve: {exc}")
         try:
           return finish_captcha_flow(
-            self.captcha.handle_before_action(page, stop_event, captcha_status)
+            self.captcha.handle_before_action(
+              page, stop_event, captcha_status, resume_after_captcha,
+            )
           )
         except Exception as retry_exc:
           log(f"[Captcha] Solve retry failed during {context}: {retry_exc}")
@@ -1732,18 +1797,27 @@ class SerpBot:
       )
 
     current_page = self._serp_page_num(page, profile)
-    serp_last_page = self._update_serp_last_page(
+    visible_serp_last_page = self._update_serp_last_page(
       page, current_page, None, max_pages, profile, log, history_page=history_page,
     )
-    serp_last_page = self._apply_serp_cap_floor(serp_last_page, history_page, max_pages)
+    serp_last_page = self._apply_serp_cap_floor(visible_serp_last_page, history_page, max_pages)
     effective_cap = serp_last_page
-    search_order = self._build_search_order(max_pages, history_page, serp_last_page)
+    search_order = self._build_search_order(max_pages, history_page, visible_serp_last_page)
     order_note = (f" (history page {history_page})" if history_page else " (no history)")
-    planned_pages = [page_num for page_num in search_order if page_num <= effective_cap]
+    planned_pages = [
+      page_num
+      for page_num in search_order
+      if not self._desktop_page_should_skip(
+        page_num,
+        max_pages=max_pages,
+        visible_serp_cap=visible_serp_last_page,
+        history_page=history_page,
+      )
+    ]
     self.logger(
       f"[Search] order for '{keyword}': {planned_pages}"
       + order_note
-      + f", SERP cap {serp_last_page or 'unknown'}"
+      + f", SERP cap {visible_serp_last_page or 'unknown'}"
     )
 
     for page_num in search_order:
@@ -1751,9 +1825,14 @@ class SerpBot:
         return None
 
       effective_cap = min(max_pages, serp_last_page) if serp_last_page else max_pages
-      if page_num > effective_cap:
+      if self._desktop_page_should_skip(
+        page_num,
+        max_pages=max_pages,
+        visible_serp_cap=visible_serp_last_page,
+        history_page=history_page,
+      ):
         self.logger(
-          f"[Search] Skip page {page_num}; Google results end at page {serp_last_page} "
+          f"[Search] Skip page {page_num}; Google results end at page {visible_serp_last_page} "
           f"(configured max {max_pages}) for '{keyword}'"
         )
         continue
@@ -1797,6 +1876,10 @@ class SerpBot:
       serp_last_page = self._update_serp_last_page(
         page, served_page_num, serp_last_page, max_pages, profile, log, history_page=history_page,
       )
+      visible_serp_last_page = min(
+        max_pages,
+        max(visible_serp_last_page or 1, serp_last_page or 1),
+      )
       serp_last_page = self._apply_serp_cap_floor(serp_last_page, history_page, max_pages)
 
       result_hrefs = self._collect_organic_result_hrefs_with_retry(
@@ -1832,6 +1915,7 @@ class SerpBot:
       requested_beyond_last = served_page_num < page_num
       if requested_beyond_last:
         serp_last_page = min(serp_last_page or served_page_num, served_page_num)
+        visible_serp_last_page = min(visible_serp_last_page or served_page_num, served_page_num)
         self.logger(
           f"[Search] Requested page {page_num} but Google kept page {served_page_num}; "
           f"results end at page {serp_last_page} for '{keyword}'"
@@ -1842,6 +1926,7 @@ class SerpBot:
         detected_end = self._detect_serp_last_page(page, served_page_num, log=log)
         if detected_end and detected_end <= served_page_num:
           serp_last_page = min(serp_last_page or served_page_num, served_page_num)
+          visible_serp_last_page = min(visible_serp_last_page or served_page_num, served_page_num)
           self.logger(
             f"[Search] No further Google pages after page {serp_last_page} for '{keyword}'"
           )
@@ -1851,8 +1936,16 @@ class SerpBot:
             f"for '{keyword}' (keeping SERP cap {serp_last_page})"
           )
 
-    effective_cap = min(max_pages, serp_last_page) if serp_last_page else max_pages
-    planned_pages = [page_num for page_num in search_order if page_num <= effective_cap]
+    planned_pages = [
+      page_num
+      for page_num in search_order
+      if not self._desktop_page_should_skip(
+        page_num,
+        max_pages=max_pages,
+        visible_serp_cap=visible_serp_last_page,
+        history_page=history_page,
+      )
+    ]
     self._last_search_exhaustion_eligible = (
       pages_with_results > 0
       and bool(planned_pages)
@@ -3775,21 +3868,73 @@ class SerpBot:
     return page
 
   @staticmethod
+  def _desktop_page_should_skip(
+    page_num: int,
+    *,
+    max_pages: int,
+    visible_serp_cap: Optional[int],
+    history_page: Optional[int],
+  ) -> bool:
+    configured_max = max(1, int(max_pages))
+    if page_num < 1 or page_num > configured_max:
+      return True
+    visible_limit = min(configured_max, max(1, int(visible_serp_cap or configured_max)))
+    if page_num <= visible_limit:
+      return False
+    if history_page and page_num == int(history_page):
+      return False
+    return True
+
+  @staticmethod
   def _build_search_order(
     max_pages: int,
     history_page: Optional[int],
-    serp_cap: Optional[int] = None,
+    visible_serp_cap: Optional[int] = None,
   ) -> list[int]:
-    configured_cap = max(1, int(max_pages))
-    effective_cap = configured_cap
-    if serp_cap and serp_cap > 0:
-      effective_cap = min(configured_cap, int(serp_cap))
+    configured_max = max(1, int(max_pages))
+    visible_cap = configured_max
+    if visible_serp_cap and int(visible_serp_cap) > 0:
+      visible_cap = min(configured_max, int(visible_serp_cap))
 
-    if effective_cap <= 1:
-      return [1]
+    history_hint = None
+    if history_page is not None:
+      try:
+        parsed = int(history_page)
+      except (TypeError, ValueError):
+        parsed = 0
+      if parsed > 1:
+        history_hint = min(parsed, configured_max)
 
-    # Always 1→N: reliable desktop pagination, no backward jumps.
-    return list(range(1, effective_cap + 1))
+    if history_hint is None:
+      if visible_cap <= 1:
+        return [1]
+      return list(range(1, visible_cap + 1))
+
+    order: list[int] = []
+    seen: set[int] = set()
+
+    def add(page: int) -> None:
+      if page < 1 or page > configured_max or page in seen:
+        return
+      seen.add(page)
+      order.append(page)
+
+    if history_hint <= visible_cap:
+      add(history_hint)
+      if history_hint > 1:
+        add(history_hint - 1)
+      if history_hint + 1 <= visible_cap:
+        add(history_hint + 1)
+      for page in range(history_hint - 2, 0, -1):
+        add(page)
+      for page in range(history_hint + 2, visible_cap + 1):
+        add(page)
+    else:
+      for page in range(visible_cap, 0, -1):
+        add(page)
+      add(history_hint)
+
+    return order or [1]
 
   def _dwell_on_site(
     self,

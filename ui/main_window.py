@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
   QHeaderView,
   QLabel,
   QLineEdit,
+  QListWidget,
+  QListWidgetItem,
   QMainWindow,
   QPlainTextEdit,
   QPushButton,
@@ -30,11 +32,26 @@ from PyQt6.QtWidgets import (
 
 from config.bot_config import BotConfig
 from config.settings_store import load_settings, save_settings
-from core.profile_status import UiStatusKey
+from core.profile_status import (
+  CAPTCHA_ELAPSED_KEYS,
+  ERROR_ELAPSED_KEYS,
+  SESSION_ELAPSED_KEYS,
+  UiStatusKey,
+  ui_label,
+)
 from core.worker import ProfileController
 from services.adspower_manager import AdsPowerManager, ProfileSpec
 from utils.cursor_agent_client import CURSOR_SDK_AVAILABLE, CursorChatController
 from utils.cursor_models import CURSOR_MODEL_CHOICES, DEFAULT_CURSOR_MODEL, normalize_cursor_model
+from utils.csv_logger import (
+  SessionClickCsvLogger,
+  aggregate_keyword_clicks,
+  count_target_not_found_in_session,
+  format_result_session_label,
+  list_session_result_files,
+  new_session_click_log_path,
+  session_result_window,
+)
 from utils.self_healer import SelfHealer
 
 PROFILE_ID_ROLE = Qt.ItemDataRole.UserRole
@@ -188,6 +205,41 @@ QTableWidget#profileTable::indicator:checked:hover {
   border-color: #e0e7ff;
   background-color: #818cf8;
 }
+QListWidget#resultSessionList {
+  background-color: #0d1017;
+  border: 1px solid #1e2430;
+  border-radius: 12px;
+  outline: none;
+  padding: 4px;
+}
+QListWidget#resultSessionList::item {
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: #cbd5e1;
+}
+QListWidget#resultSessionList::item:selected {
+  background-color: #1e2a4a;
+  color: #f1f5f9;
+}
+QListWidget#resultSessionList::item:hover:!selected {
+  background-color: #151922;
+}
+QTableWidget#resultTable {
+  background-color: #0d1017;
+  border: 1px solid #1e2430;
+  border-radius: 12px;
+  gridline-color: #1a2030;
+  alternate-background-color: #0f1219;
+  outline: none;
+}
+QTableWidget#resultTable::item {
+  padding: 6px 8px;
+  border: none;
+}
+QTableWidget#resultTable::item:selected {
+  background-color: #1e2a4a;
+  color: #f1f5f9;
+}
 QHeaderView::section {
   background-color: #11141c;
   color: #94a3b8;
@@ -248,6 +300,22 @@ QPushButton#btnRefresh:hover {
   color: #f1f5f9;
 }
 QPushButton#btnRefresh:pressed { background-color: #1e293b; }
+QPushButton#btnKeywordClicks {
+  background-color: #1e2430;
+  color: #cbd5e1;
+  border: 1px solid #475569;
+  padding: 7px 14px;
+}
+QPushButton#btnKeywordClicks:hover {
+  background-color: #334155;
+  border-color: #94a3b8;
+  color: #f1f5f9;
+}
+QPushButton#btnKeywordClicks:checked {
+  background-color: #4f46e5;
+  border-color: #818cf8;
+  color: #ffffff;
+}
 QPushButton#btnStartAuto {
   background-color: #059669;
   color: #ffffff;
@@ -436,11 +504,17 @@ QScrollBar::handle:vertical {
 QScrollBar::handle:vertical:hover { background: #475569; }
 """
 
+_SESSION_GREEN = QColor("#34d399")
 STATUS_COLORS = {
-  UiStatusKey.NORMAL.value: QColor("#34d399"),
-  UiStatusKey.CAPTCHA.value: QColor("#f87171"),
-  UiStatusKey.CAPTCHA_MANUAL.value: QColor("#fb923c"),
-  UiStatusKey.ERROR.value: QColor("#fbbf24"),
+  UiStatusKey.CREATING_PROFILE.value: _SESSION_GREEN,
+  UiStatusKey.LAUNCHING.value: _SESSION_GREEN,
+  UiStatusKey.CHECKING_IP.value: _SESSION_GREEN,
+  UiStatusKey.WARMING_UP.value: _SESSION_GREEN,
+  UiStatusKey.SEARCHING.value: _SESSION_GREEN,
+  UiStatusKey.VISITING_SITE.value: _SESSION_GREEN,
+  UiStatusKey.CAPTCHA.value: QColor("#fbbf24"),
+  UiStatusKey.CAPTCHA_MANUAL.value: QColor("#fbbf24"),
+  UiStatusKey.ERROR.value: QColor("#f87171"),
   UiStatusKey.SELF_HEALING.value: QColor("#c084fc"),
   UiStatusKey.CLOSED.value: QColor("#64748b"),
 }
@@ -481,11 +555,11 @@ class UiMainWindow(QMainWindow):
     "No",
     "ID",
     "Name",
-    "Device OS",
+    "Device",
     "Browser",
     "Proxy / IP",
-    "Proxy Traffic",
-    "Current Status",
+    "Traffic",
+    "Status",
     "Actions",
   )
 
@@ -504,6 +578,8 @@ class UiMainWindow(QMainWindow):
     self._status_map: dict[str, tuple[str, str]] = {}
     self._profile_traffic_totals: dict[str, int] = {}
     self._session_traffic_total: int = 0
+    self._overall_clicks_session: int = 0
+    self._session_click_log_path: str = ""
     self._global_running = False
     self._syncing_select_all = False
     self._ai_fix_assistant_open = False
@@ -554,6 +630,8 @@ class UiMainWindow(QMainWindow):
     self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
     self.tabs.addTab(self._build_ai_fix_tab(), "AI Fix")
     self.tabs.addTab(self._build_settings_tab(), "Settings")
+    self.tabs.addTab(self._build_result_tab(), "Result")
+    self._result_tab_index = self.tabs.count() - 1
 
   @staticmethod
   def _card_panel(inner: QHBoxLayout | QVBoxLayout) -> QFrame:
@@ -591,7 +669,7 @@ class UiMainWindow(QMainWindow):
     self.btn_stop_auto = QPushButton("Stop Automation")
     self.btn_stop_auto.setObjectName("btnStopAuto")
     self.btn_stop_auto.setEnabled(False)
-    self.proxy_traffic_title_label = QLabel("Proxy Traffic Total")
+    self.proxy_traffic_title_label = QLabel("Traffic Total")
     self.proxy_traffic_title_label.setObjectName("trafficTotalTitle")
     self.proxy_traffic_total_label = QLabel("0 B")
     self.proxy_traffic_total_label.setObjectName("trafficTotalValue")
@@ -599,6 +677,10 @@ class UiMainWindow(QMainWindow):
     self.present_cycle_title_label.setObjectName("trafficTotalTitle")
     self.present_cycle_value_label = QLabel("0 / 0")
     self.present_cycle_value_label.setObjectName("trafficTotalValue")
+    self.overall_clicks_title_label = QLabel("Overall Clicks")
+    self.overall_clicks_title_label.setObjectName("trafficTotalTitle")
+    self.overall_clicks_value_label = QLabel("0")
+    self.overall_clicks_value_label.setObjectName("trafficTotalValue")
 
     count_label = QLabel("Count")
     count_label.setObjectName("sectionTitle")
@@ -641,8 +723,20 @@ class UiMainWindow(QMainWindow):
     cycle_layout.setSpacing(1)
     cycle_layout.addWidget(self.present_cycle_title_label, alignment=Qt.AlignmentFlag.AlignHCenter)
     cycle_layout.addWidget(self.present_cycle_value_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+    clicks_box = QWidget()
+    clicks_layout = QVBoxLayout(clicks_box)
+    clicks_layout.setContentsMargins(0, 0, 0, 0)
+    clicks_layout.setSpacing(1)
+    clicks_layout.addWidget(self.overall_clicks_title_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+    clicks_layout.addWidget(self.overall_clicks_value_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+    cycle_clicks_box = QWidget()
+    cycle_clicks_layout = QHBoxLayout(cycle_clicks_box)
+    cycle_clicks_layout.setContentsMargins(0, 0, 0, 0)
+    cycle_clicks_layout.setSpacing(18)
+    cycle_clicks_layout.addWidget(cycle_box)
+    cycle_clicks_layout.addWidget(clicks_box)
     control_bar.addWidget(traffic_box)
-    control_bar.addWidget(cycle_box)
+    control_bar.addWidget(cycle_clicks_box)
     control_bar.addStretch()
     control_bar.addWidget(threads_label)
     control_bar.addWidget(self.threads_spin)
@@ -679,19 +773,21 @@ class UiMainWindow(QMainWindow):
     self.profile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     self.profile_table.verticalHeader().setVisible(False)
-    self.profile_table.verticalHeader().setDefaultSectionSize(36)
+    self.profile_table.verticalHeader().setDefaultSectionSize(54)
     header = self.profile_table.horizontalHeader()
     header.setStretchLastSection(False)
+    header.setMinimumSectionSize(44)
     header.setSectionResizeMode(self.COL_CHECK, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_NO, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_ID, QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_OS, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_BROWSER, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_PROXY, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_TRAFFIC, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(self.COL_ACTIONS, QHeaderView.ResizeMode.ResizeToContents)
+    self.profile_table.setColumnWidth(self.COL_STATUS, 150)
     self.profile_table.setWordWrap(True)
     self.profile_table.setTextElideMode(Qt.TextElideMode.ElideNone)
     self.profile_table.itemChanged.connect(self._on_profile_table_item_changed)
@@ -865,6 +961,25 @@ class UiMainWindow(QMainWindow):
     target_form.addRow("Action Delay (sec):", self._wrap_row(action_row))
     target_form.addRow("Max Search Pages:", self.max_search_pages)
     target_form.addRow("Max Keywords / Profile:", self.max_keywords_per_profile)
+    self.chk_ip_check_session = QCheckBox("At session start")
+    self.chk_ip_check_session.setChecked(False)
+    self.chk_ip_check_session.setToolTip(
+      "Off (default): skip proxy IP lookup when a profile session begins (saves traffic).\n"
+      "On: fetch egress IP once via lightweight browser fetch before opening Google."
+    )
+    self.chk_ip_check_keyword2 = QCheckBox("Before 2nd keyword")
+    self.chk_ip_check_keyword2.setChecked(False)
+    self.chk_ip_check_keyword2.setToolTip(
+      "Off (default): do not compare IP again before the 2nd keyword.\n"
+      "On: re-check IP before keyword 2 and stop the profile if it changed "
+      "(requires session-start IP check to capture a baseline)."
+    )
+    ip_check_col = QVBoxLayout()
+    ip_check_col.setContentsMargins(0, 0, 0, 0)
+    ip_check_col.setSpacing(4)
+    ip_check_col.addWidget(self.chk_ip_check_session)
+    ip_check_col.addWidget(self.chk_ip_check_keyword2)
+    target_form.addRow("IP Check:", self._wrap_col(ip_check_col))
     left_col.addWidget(target_group)
     left_col.addStretch()
 
@@ -910,6 +1025,246 @@ class UiMainWindow(QMainWindow):
     root.addLayout(save_bar)
     return tab
 
+  def _build_result_tab(self) -> QWidget:
+    tab = QWidget()
+    layout = QVBoxLayout(tab)
+    layout.setContentsMargins(8, 8, 8, 8)
+    layout.setSpacing(10)
+
+    title = QLabel("Session Results")
+    title.setObjectName("appTitle")
+    layout.addWidget(title)
+
+    content = QVBoxLayout()
+    content.setSpacing(8)
+
+    header_row = QHBoxLayout()
+    header_row.setSpacing(12)
+    sessions_title = QLabel("SESSIONS")
+    sessions_title.setObjectName("sectionTitle")
+
+    stats_row = QHBoxLayout()
+    stats_row.setSpacing(18)
+    total_box = QVBoxLayout()
+    total_box.setSpacing(1)
+    total_title = QLabel("Total Clicks")
+    total_title.setObjectName("trafficTotalTitle")
+    self.result_total_clicks_value = QLabel("0")
+    self.result_total_clicks_value.setObjectName("trafficTotalValue")
+    total_box.addWidget(total_title, alignment=Qt.AlignmentFlag.AlignRight)
+    total_box.addWidget(self.result_total_clicks_value, alignment=Qt.AlignmentFlag.AlignRight)
+
+    failed_box = QVBoxLayout()
+    failed_box.setSpacing(1)
+    failed_title = QLabel("Not Found")
+    failed_title.setObjectName("trafficTotalTitle")
+    self.result_not_found_value = QLabel("0")
+    self.result_not_found_value.setObjectName("trafficTotalValue")
+    failed_box.addWidget(failed_title, alignment=Qt.AlignmentFlag.AlignRight)
+    failed_box.addWidget(self.result_not_found_value, alignment=Qt.AlignmentFlag.AlignRight)
+
+    stats_row.addStretch()
+    stats_row.addLayout(total_box)
+    stats_row.addLayout(failed_box)
+
+    header_row.addWidget(sessions_title, stretch=1)
+    header_row.addLayout(stats_row, stretch=3)
+
+    body_row = QHBoxLayout()
+    body_row.setSpacing(12)
+    self.result_session_list = QListWidget()
+    self.result_session_list.setObjectName("resultSessionList")
+
+    table_panel = QWidget()
+    table_panel_layout = QVBoxLayout(table_panel)
+    table_panel_layout.setContentsMargins(0, 0, 0, 0)
+    table_panel_layout.setSpacing(8)
+    table_toolbar = QHBoxLayout()
+    table_toolbar.setSpacing(8)
+    self.btn_result_keyword_clicks = QPushButton("Keyword Clicks")
+    self.btn_result_keyword_clicks.setObjectName("btnKeywordClicks")
+    self.btn_result_keyword_clicks.setCheckable(True)
+    self.btn_result_keyword_clicks.setToolTip(
+      "Show per-keyword click totals (Windows / mobile), sorted by total clicks"
+    )
+    table_toolbar.addWidget(self.btn_result_keyword_clicks)
+    table_toolbar.addStretch()
+
+    self.result_table = QTableWidget(0, 0)
+    self.result_table.setObjectName("resultTable")
+    self.result_table.setAlternatingRowColors(True)
+    self.result_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    self.result_table.verticalHeader().setVisible(False)
+    result_header = self.result_table.horizontalHeader()
+    result_header.setStretchLastSection(True)
+
+    table_panel_layout.addLayout(table_toolbar)
+    table_panel_layout.addWidget(self.result_table, stretch=1)
+
+    body_row.addWidget(self.result_session_list, stretch=1)
+    body_row.addWidget(table_panel, stretch=3)
+
+    footer_row = QHBoxLayout()
+    footer_row.setSpacing(12)
+    self.btn_refresh_results = QPushButton("Refresh")
+    self.btn_refresh_results.setObjectName("btnRefresh")
+    footer_row.addWidget(self.btn_refresh_results, stretch=1)
+    footer_row.addStretch(3)
+
+    content.addLayout(header_row)
+    content.addLayout(body_row, stretch=1)
+    content.addLayout(footer_row)
+    layout.addLayout(content, stretch=1)
+
+    self._refreshing_result_list = False
+    self._result_session_files: list[Path] = []
+    self._result_loaded_path: Path | None = None
+    self._result_loaded_headers: list[str] = []
+    self._result_loaded_rows: list[list[str]] = []
+    self.result_session_list.currentItemChanged.connect(self._on_result_session_selected)
+    self.btn_refresh_results.clicked.connect(self._refresh_result_file_list)
+    self.btn_result_keyword_clicks.toggled.connect(self._on_result_keyword_clicks_toggled)
+    QTimer.singleShot(0, self._refresh_result_file_list)
+    return tab
+
+  def _refresh_result_file_list(self) -> None:
+    if getattr(self, "_refreshing_result_list", False):
+      return
+    self._refreshing_result_list = True
+    try:
+      selected_path = ""
+      current = self.result_session_list.currentItem()
+      if current is not None:
+        selected_path = str(current.data(Qt.ItemDataRole.UserRole) or "")
+
+      data_dir = self._project_root / "data"
+      files = list_session_result_files(data_dir)
+      self._result_session_files = files
+
+      self.result_session_list.blockSignals(True)
+      self.result_session_list.clear()
+      select_row = 0
+      for index, path in enumerate(files):
+        item = QListWidgetItem(format_result_session_label(path))
+        item.setData(Qt.ItemDataRole.UserRole, str(path.resolve()))
+        item.setToolTip(path.name)
+        self.result_session_list.addItem(item)
+        if selected_path and str(path.resolve()) == selected_path:
+          select_row = index
+
+      self.result_session_list.blockSignals(False)
+
+      if files:
+        self.result_session_list.setCurrentRow(select_row)
+        self._load_result_session(files[select_row])
+      else:
+        self._clear_result_session_view()
+    finally:
+      self._refreshing_result_list = False
+
+  def _on_result_session_selected(
+    self,
+    current: QListWidgetItem | None,
+    _previous: QListWidgetItem | None,
+  ) -> None:
+    if self._refreshing_result_list or current is None:
+      return
+    path_text = str(current.data(Qt.ItemDataRole.UserRole) or "").strip()
+    if not path_text:
+      return
+    self._load_result_session(Path(path_text))
+
+  def _clear_result_session_view(self) -> None:
+    self.result_total_clicks_value.setText("0")
+    self.result_not_found_value.setText("0")
+    self._result_loaded_path = None
+    self._result_loaded_headers = []
+    self._result_loaded_rows = []
+    self.result_table.clear()
+    self.result_table.setRowCount(0)
+    self.result_table.setColumnCount(0)
+
+  def _load_result_session(self, path: Path) -> None:
+    headers, rows = SessionClickCsvLogger.read_rows(path)
+    self._result_loaded_path = path
+    self._result_loaded_headers = headers
+    self._result_loaded_rows = rows
+    self.result_total_clicks_value.setText(str(len(rows)))
+
+    session_start, session_end = session_result_window(path, self._result_session_files)
+    not_found = 0
+    if session_start is not None:
+      not_found = count_target_not_found_in_session(
+        session_start,
+        session_end,
+        session_log_path=self._project_root / "data" / "session.log",
+      )
+    self.result_not_found_value.setText(str(not_found))
+    self._render_result_table()
+
+  def _on_result_keyword_clicks_toggled(self, checked: bool) -> None:
+    self.btn_result_keyword_clicks.setText("All Clicks" if checked else "Keyword Clicks")
+    if self._result_loaded_path is not None:
+      self._render_result_table()
+
+  def _render_result_table(self) -> None:
+    if self.btn_result_keyword_clicks.isChecked():
+      self._render_result_keyword_table()
+    else:
+      self._render_result_detail_table()
+
+  def _render_result_detail_table(self) -> None:
+    headers = self._result_loaded_headers
+    rows = self._result_loaded_rows
+    display_headers = headers or [
+      "datetime",
+      "profile_name",
+      "device",
+      "keyword",
+      "url",
+      "page",
+      "rank",
+      "overall_rank",
+    ]
+    self.result_table.setColumnCount(len(display_headers))
+    self.result_table.setHorizontalHeaderLabels(display_headers)
+    self.result_table.setRowCount(len(rows))
+    for row_index, row in enumerate(rows):
+      for col_index, header_name in enumerate(display_headers):
+        value = row[col_index] if col_index < len(row) else ""
+        self.result_table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
+    self._resize_result_table_columns(len(display_headers))
+
+  def _render_result_keyword_table(self) -> None:
+    summaries = aggregate_keyword_clicks(self._result_loaded_headers, self._result_loaded_rows)
+    display_headers = ("keyword", "total_clicks", "windows", "mobile")
+    self.result_table.setColumnCount(len(display_headers))
+    self.result_table.setHorizontalHeaderLabels(
+      ["Keyword", "Total Clicks", "Windows", "Mobile"]
+    )
+    self.result_table.setRowCount(len(summaries))
+    for row_index, summary in enumerate(summaries):
+      values = (
+        summary["keyword"],
+        str(summary["total"]),
+        str(summary["windows"]),
+        str(summary["mobile"]),
+      )
+      for col_index, value in enumerate(values):
+        self.result_table.setItem(row_index, col_index, QTableWidgetItem(value))
+    self._resize_result_table_columns(len(display_headers))
+
+  def _resize_result_table_columns(self, column_count: int) -> None:
+    header = self.result_table.horizontalHeader()
+    header.setStretchLastSection(True)
+    for col_index in range(max(0, column_count - 1)):
+      header.setSectionResizeMode(col_index, QHeaderView.ResizeMode.ResizeToContents)
+
+  def _on_main_tab_changed(self, index: int) -> None:
+    if index == getattr(self, "_result_tab_index", -1):
+      self._refresh_result_file_list()
+
   def _make_settings_multiline_edit(self, placeholder: str, *, min_height: int = 100) -> QPlainTextEdit:
     edit = QPlainTextEdit()
     edit.setObjectName("settingsMultilineEdit")
@@ -946,6 +1301,12 @@ class UiMainWindow(QMainWindow):
     container.setLayout(row)
     return container
 
+  @staticmethod
+  def _wrap_col(layout: QVBoxLayout) -> QWidget:
+    container = QWidget()
+    container.setLayout(layout)
+    return container
+
   def _wire_signals(self) -> None:
     self.btn_create.clicked.connect(self.on_create_profiles)
     self.btn_refresh.clicked.connect(self.on_refresh_profiles)
@@ -960,6 +1321,7 @@ class UiMainWindow(QMainWindow):
     self.btn_bulk_pause.clicked.connect(self.on_bulk_pause)
     self.btn_bulk_kill.clicked.connect(self.on_bulk_kill)
     self.btn_bulk_delete.clicked.connect(self.on_bulk_delete)
+    self.tabs.currentChanged.connect(self._on_main_tab_changed)
     self._controller.log.connect(self.append_log, Qt.ConnectionType.QueuedConnection)
     self._controller.profile_update.connect(self._on_profile_update, Qt.ConnectionType.QueuedConnection)
     self._controller.proxy_traffic_update.connect(
@@ -972,6 +1334,18 @@ class UiMainWindow(QMainWindow):
     )
     self._controller.cycle_progress_update.connect(
       self._on_cycle_progress_update,
+      Qt.ConnectionType.QueuedConnection,
+    )
+    self._controller.profile_finished.connect(
+      self._on_profile_finished,
+      Qt.ConnectionType.QueuedConnection,
+    )
+    self._controller.target_click_logged.connect(
+      self._refresh_overall_clicks,
+      Qt.ConnectionType.QueuedConnection,
+    )
+    self._controller.target_click_logged.connect(
+      self._on_result_click_logged,
       Qt.ConnectionType.QueuedConnection,
     )
     self._controller.profile_created.connect(
@@ -1272,6 +1646,8 @@ class UiMainWindow(QMainWindow):
       "action_delay_max": self.action_delay_max.value(),
       "max_search_pages": self.max_search_pages.value(),
       "max_keywords_per_profile": self.max_keywords_per_profile.value(),
+      "ip_check_session_start": self.chk_ip_check_session.isChecked(),
+      "ip_check_enabled": self.chk_ip_check_keyword2.isChecked(),
       "profile_count": self.profile_count_spin.value(),
       "automation_threads": self.threads_spin.value(),
       "automation_cycles": self.cycles_spin.value(),
@@ -1311,6 +1687,8 @@ class UiMainWindow(QMainWindow):
     self.max_keywords_per_profile.setValue(
       int(data.get("max_keywords_per_profile", self.max_keywords_per_profile.value()))
     )
+    self.chk_ip_check_session.setChecked(bool(data.get("ip_check_session_start", False)))
+    self.chk_ip_check_keyword2.setChecked(bool(data.get("ip_check_enabled", False)))
     self.profile_count_spin.setValue(int(data.get("profile_count", self.profile_count_spin.value())))
     self.threads_spin.setValue(int(data.get("automation_threads", self.threads_spin.value())))
     self.cycles_spin.setValue(int(data.get("automation_cycles", self.cycles_spin.value())))
@@ -1403,6 +1781,8 @@ class UiMainWindow(QMainWindow):
       action_delay_max=self.action_delay_max.value(),
       max_search_pages=self.max_search_pages.value(),
       max_keywords_per_profile=self.max_keywords_per_profile.value(),
+      ip_check_session_start=self.chk_ip_check_session.isChecked(),
+      ip_check_enabled=self.chk_ip_check_keyword2.isChecked(),
       automation_threads=self.threads_spin.value(),
       automation_cycles=self.cycles_spin.value(),
       profile_count=self.profile_count_spin.value(),
@@ -1423,14 +1803,7 @@ class UiMainWindow(QMainWindow):
 
   @staticmethod
   def _device_os(profile: ProfileSpec) -> str:
-    os_type = (profile.os_type or "Unknown").strip()
-    if not os_type:
-      return "Unknown"
-    if os_type.lower() == "macos":
-      return "macOS"
-    if os_type.lower() == "ios":
-      return "iOS"
-    return os_type[:1].upper() + os_type[1:]
+    return profile.device_label
 
   def _populate_profile_table(self) -> None:
     self.profile_table.blockSignals(True)
@@ -1476,8 +1849,8 @@ class UiMainWindow(QMainWindow):
         initial_key = saved_key
         initial_text = saved_text
       else:
-        initial_key = UiStatusKey.NORMAL.value if profile.is_active else UiStatusKey.CLOSED.value
-        initial_text = UiStatusKey.NORMAL.value if profile.is_active else UiStatusKey.CLOSED.value
+        initial_key = UiStatusKey.CLOSED.value
+        initial_text = ui_label(UiStatusKey.CLOSED)
       status_item = QTableWidgetItem(initial_text)
       self._style_status_item(status_item, initial_key, initial_text)
       self.profile_table.setItem(row, self.COL_STATUS, status_item)
@@ -1618,6 +1991,37 @@ class UiMainWindow(QMainWindow):
     except Exception as exc:
       self.append_log(f"[UI] Profile delete failed: {exc}")
 
+  def _begin_session_click_log(self, config: BotConfig) -> str:
+    path = new_session_click_log_path("data")
+    config.session_click_log_path = str(path)
+    self._session_click_log_path = str(path)
+    self.append_log(f"[UI] Click log file: {path}")
+    if hasattr(self, "result_session_list"):
+      QTimer.singleShot(0, self._refresh_result_file_list)
+    return str(path)
+
+  def _reset_overall_clicks(self) -> None:
+    self._overall_clicks_session = 0
+    self.overall_clicks_value_label.setText("0")
+
+  def _refresh_overall_clicks(self) -> None:
+    path = (self._session_click_log_path or "").strip()
+    if not path:
+      return
+    total = SessionClickCsvLogger.count_rows(path)
+    self._overall_clicks_session = total
+    self.overall_clicks_value_label.setText(str(total))
+
+  def _on_result_click_logged(self) -> None:
+    if self.tabs.currentIndex() != getattr(self, "_result_tab_index", -1):
+      return
+    current = self.result_session_list.currentItem()
+    active_path = (self._session_click_log_path or "").strip()
+    if not current or not active_path:
+      return
+    if str(current.data(Qt.ItemDataRole.UserRole) or "") == str(Path(active_path).resolve()):
+      self._load_result_session(Path(active_path))
+
   def on_bulk_start(self) -> None:
     profile_ids = self._get_selected_profile_ids()
     if not profile_ids:
@@ -1628,6 +2032,8 @@ class UiMainWindow(QMainWindow):
     except ValueError as exc:
       self.append_log(f"[UI] {exc}")
       return
+    self._begin_session_click_log(config)
+    self._reset_overall_clicks()
     started = 0
     for profile_id in profile_ids:
       if self._controller.start_profile_manual(profile_id, config):
@@ -1663,12 +2069,39 @@ class UiMainWindow(QMainWindow):
         return row
     return -1
 
+  def _format_status_display(self, display_text: str) -> str:
+    text = (display_text or "").strip()
+    if not text:
+      return text
+    timer_match = re.match(r"^(.+?)\s+(\[\d{2,}:\d{2}\])$", text)
+    if timer_match:
+      return f"{timer_match.group(1).strip()}\n{timer_match.group(2)}"
+    paren_match = re.match(r"^(.+?)\s+(\([^)]+\))$", text)
+    if paren_match and len(text) > 14:
+      return f"{paren_match.group(1).strip()}\n{paren_match.group(2)}"
+    words = text.split()
+    if len(words) >= 3 and len(text) > 16:
+      mid = (len(words) + 1) // 2
+      return "\n".join([" ".join(words[:mid]), " ".join(words[mid:])])
+    return text
+
   def _style_status_item(self, item: QTableWidgetItem, status_key: str, display_text: str) -> None:
-    item.setText(display_text)
+    formatted = self._format_status_display(display_text)
+    item.setText(formatted)
+    item.setToolTip(display_text)
+    item.setTextAlignment(
+      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    )
     color = STATUS_COLORS.get(status_key, QColor("#808080"))
     item.setForeground(color)
     font = item.font()
-    font.setBold(status_key in (UiStatusKey.CAPTCHA_MANUAL.value, UiStatusKey.SELF_HEALING.value))
+    font.setBold(
+      status_key in (
+        UiStatusKey.CAPTCHA.value,
+        UiStatusKey.CAPTCHA_MANUAL.value,
+        UiStatusKey.SELF_HEALING.value,
+      )
+    )
     item.setFont(font)
 
   def _strip_timer_suffix(self, text: str) -> str:
@@ -1682,7 +2115,14 @@ class UiMainWindow(QMainWindow):
   ) -> str:
     if self._controller.get_cooldown_remaining(profile_id) > 0:
       return display_text
-    elapsed = self._controller.get_session_elapsed(profile_id)
+    if status_key in CAPTCHA_ELAPSED_KEYS:
+      elapsed = self._controller.get_captcha_elapsed(profile_id)
+    elif status_key in ERROR_ELAPSED_KEYS:
+      elapsed = self._controller.get_error_elapsed(profile_id)
+    elif status_key in SESSION_ELAPSED_KEYS:
+      elapsed = self._controller.get_session_elapsed(profile_id)
+    else:
+      return self._strip_timer_suffix(display_text)
     if elapsed <= 0:
       return self._strip_timer_suffix(display_text)
     base = self._strip_timer_suffix(display_text) or status_key
@@ -1696,6 +2136,7 @@ class UiMainWindow(QMainWindow):
     item = self.profile_table.item(row, self.COL_STATUS)
     if item:
       self._style_status_item(item, status_key, display_text)
+      self.profile_table.resizeRowToContents(row)
     self._status_map[profile_id] = (status_key, display_text)
 
   def _tick_cooldowns(self) -> None:
@@ -1703,13 +2144,12 @@ class UiMainWindow(QMainWindow):
       remaining = self._controller.get_cooldown_remaining(profile_id)
       if remaining > 0:
         minutes, seconds = divmod(remaining, 60)
-        text = f"{UiStatusKey.CLOSED.value} [{minutes:02d}:{seconds:02d}]"
+        text = f"{ui_label(UiStatusKey.CLOSED)} [{minutes:02d}:{seconds:02d}]"
         self._update_status_cell(profile_id, UiStatusKey.CLOSED.value, text)
         continue
-      elapsed = self._controller.get_session_elapsed(profile_id)
-      if elapsed <= 0:
-        continue
       status_key, display_text = self._status_map[profile_id]
+      if status_key not in SESSION_ELAPSED_KEYS | CAPTCHA_ELAPSED_KEYS | ERROR_ELAPSED_KEYS:
+        continue
       text = self._format_status_with_elapsed(profile_id, status_key, display_text)
       if text != display_text:
         self._update_status_cell(profile_id, status_key, text)
@@ -1809,6 +2249,14 @@ class UiMainWindow(QMainWindow):
     target = max(0, int(target_cycles))
     self.present_cycle_value_label.setText(f"{current} / {target}")
 
+  def _on_profile_finished(self, profile_id: str, outcome: str) -> None:
+    _ = profile_id
+    if outcome == "not_found" and self.tabs.currentIndex() == getattr(self, "_result_tab_index", -1):
+      current = self.result_session_list.currentItem()
+      active_path = (self._session_click_log_path or "").strip()
+      if current and active_path and str(current.data(Qt.ItemDataRole.UserRole) or "") == str(Path(active_path).resolve()):
+        self._load_result_session(Path(active_path))
+
   def on_create_profiles(self) -> None:
     try:
       config = self._build_config(require_lists=False)
@@ -1901,6 +2349,8 @@ class UiMainWindow(QMainWindow):
     config.automation_threads = self.threads_spin.value()
     config.automation_cycles = self.cycles_spin.value()
     self.present_cycle_value_label.setText(f"0 / {config.automation_cycles}")
+    self._begin_session_click_log(config)
+    self._reset_overall_clicks()
     cleared = self._controller.clear_keyword_exclusions(config.target_domain)
     if cleared:
       self.append_log(
@@ -1909,7 +2359,7 @@ class UiMainWindow(QMainWindow):
     try:
       manager = AdsPowerManager(config.adspower_url, config.adspower_api_key, self.append_log)
       manager.reset_profile_name_counter(0)
-      self.append_log("[UI] Automation run naming reset: next profile starts at serp-auto-001.")
+      self.append_log("[UI] Automation run naming reset: next profile starts at s-001.")
     except Exception as exc:
       self.append_log(f"[UI] Failed to reset automation name counter: {exc}")
       return
@@ -1943,6 +2393,8 @@ class UiMainWindow(QMainWindow):
     except ValueError as exc:
       self.append_log(f"[UI] {exc}")
       return
+    self._begin_session_click_log(config)
+    self._reset_overall_clicks()
     self._controller.start_profile_manual(profile_id, config)
 
   def _on_row_pause(self, profile_id: str) -> None:

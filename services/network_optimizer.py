@@ -22,6 +22,14 @@ TRAFFIC_LOG_PATH = Path("data/traffic_sessions.jsonl")
 _PRIORITY_ORDER = ("document", "script", "xhr", "fetch", "stylesheet", "image")
 
 
+_IP_CHECK_HOSTS = frozenset({
+  "api.ipify.org",
+  "checkip.amazonaws.com",
+  "ipv4.icanhazip.com",
+  "icanhazip.com",
+})
+
+
 class PagePhase(str, Enum):
   GOOGLE_SERP = "google_serp"
   TARGET_SITE = "target_site"
@@ -345,6 +353,8 @@ class NetworkOptimizer:
       return False
     if self.is_captcha_or_security_url(url, host):
       return False
+    if self.is_ip_check_url(host):
+      return False
 
     if self.phase == PagePhase.GOOGLE_SERP:
       return self._should_abort_google_serp(resource_type, url, host)
@@ -466,6 +476,11 @@ class NetworkOptimizer:
     if host.endswith("stats.g.doubleclick.net") and ("/collect" in url or "/g/collect" in url):
       return True
     return any(token in url for token in cls._GA_URL_TOKENS)
+
+  @classmethod
+  def is_ip_check_url(cls, host: str) -> bool:
+    normalized = (host or "").lower().removeprefix("www.")
+    return normalized in _IP_CHECK_HOSTS
 
   @classmethod
   def is_captcha_or_security_url(cls, url: str, host: str) -> bool:

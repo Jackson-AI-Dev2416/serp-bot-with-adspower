@@ -9,9 +9,10 @@ from urllib.parse import urlparse
 import httpx
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
-from core.profile_status import UiStatusKey
+from core.profile_status import UiStatusKey, ui_label
 
 StatusNotify = Callable[[str, str], None]
+ClearedNotify = Callable[[], None]
 SETTINGS_PATH = Path("data/settings.json")
 CAPTCHA_EVENTS_PATH = Path("data/captcha_events.jsonl")
 
@@ -162,6 +163,7 @@ class CaptchaSolver:
     page: Page,
     stop_event: Optional[threading.Event] = None,
     on_status: Optional[StatusNotify] = None,
+    on_cleared: Optional[ClearedNotify] = None,
     *,
     captcha_type: str = "",
   ) -> str:
@@ -188,7 +190,7 @@ class CaptchaSolver:
     self._log("[Captcha] 1. CAPTCHA DETECTED — workflow paused until solved (WAIT_CAPTCHA)")
     if on_status:
       try:
-        on_status(UiStatusKey.CAPTCHA.value, UiStatusKey.CAPTCHA.value)
+        on_status(UiStatusKey.CAPTCHA.value, ui_label(UiStatusKey.CAPTCHA))
       except Exception as status_exc:
         self._log(f"[Captcha] UI status update warning (continuing solve): {status_exc}")
     detected_type = captcha_type or self._detect_captcha_type(page)
@@ -201,6 +203,7 @@ class CaptchaSolver:
         self._log("[Captcha] Auto solve unresolved -> waiting for manual resolution")
         result = self._wait_manual_resolution(page, stop_event, on_status, detected_type)
       if result == "ok":
+        self._notify_captcha_cleared(on_cleared)
         self._awaiting_clear = False
         page = self._refresh_page_after_captcha(page)
       return result
@@ -208,9 +211,19 @@ class CaptchaSolver:
     self.logger("[CapSolver] No API key configured — manual captcha mode")
     result = self._wait_manual_resolution(page, stop_event, on_status, detected_type)
     if result == "ok":
+      self._notify_captcha_cleared(on_cleared)
       self._awaiting_clear = False
       page = self._refresh_page_after_captcha(page)
     return result
+
+  @staticmethod
+  def _notify_captcha_cleared(on_cleared: Optional[ClearedNotify]) -> None:
+    if not on_cleared:
+      return
+    try:
+      on_cleared()
+    except Exception:
+      pass
 
   def is_captcha_present(self, page: Page) -> bool:
     if page.is_closed():
@@ -440,7 +453,7 @@ class CaptchaSolver:
 
   def _solve_automated(self, page: Page, on_status: Optional[StatusNotify], captcha_type: str = "") -> str:
     if on_status:
-      on_status(UiStatusKey.CAPTCHA.value, UiStatusKey.CAPTCHA.value)
+      on_status(UiStatusKey.CAPTCHA.value, ui_label(UiStatusKey.CAPTCHA))
 
     sitekey, task_type, enterprise_s, callback_name, is_google = self._wait_for_captcha_meta(page)
     if not sitekey:
@@ -625,7 +638,7 @@ class CaptchaSolver:
     captcha_type: str = "",
   ) -> str:
     if on_status:
-      on_status(UiStatusKey.CAPTCHA_MANUAL.value, UiStatusKey.CAPTCHA_MANUAL.value)
+      on_status(UiStatusKey.CAPTCHA_MANUAL.value, ui_label(UiStatusKey.CAPTCHA_MANUAL))
     self._log("[Captcha] 2. CAPTCHA SOLVE REQUEST: MANUAL")
 
     self._log("[Captcha] Manual mode — waiting until captcha is solved (do not close the tab)")

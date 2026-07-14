@@ -13,7 +13,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from config.bot_config import BotConfig
-from core.profile_status import UiStatusKey
+from core.profile_status import UiStatusKey, ui_label
 
 HEALER_RESULT_PATH = Path("data/healer_result.json")
 MANUAL_FIX_REQUEST_PATH = Path("data/manual_fix_request.json")
@@ -138,7 +138,11 @@ class SelfHealer(QObject):
       mode,
     ]
 
-    self.healing_started.emit(profile_id, UiStatusKey.SELF_HEALING.value, UiStatusKey.SELF_HEALING.value)
+    self.healing_started.emit(
+      profile_id,
+      UiStatusKey.SELF_HEALING.value,
+      ui_label(UiStatusKey.SELF_HEALING),
+    )
     self.log.emit(f"[Self-Healer] Launching {log_label} subprocess (profile={profile_id})")
 
     process = subprocess.Popen(
@@ -161,7 +165,15 @@ class SelfHealer(QObject):
     if success:
       self.log.emit(f"[Self-Healer] Fix applied — {message}")
       self.log.emit("[Self-Healer] Restart the app to load code changes.")
-      self.healing_finished.emit(profile_id, UiStatusKey.CLOSED.value, UiStatusKey.CLOSED.value)
+      self.healing_finished.emit(
+        profile_id,
+        UiStatusKey.CLOSED.value,
+        ui_label(UiStatusKey.CLOSED),
+      )
     else:
       self.log.emit(f"[Self-Healer] Fix failed: {message}")
-      self.healing_finished.emit(profile_id, UiStatusKey.ERROR.value, UiStatusKey.ERROR.value)
+      self.healing_finished.emit(
+        profile_id,
+        UiStatusKey.ERROR.value,
+        ui_label(UiStatusKey.ERROR),
+      )

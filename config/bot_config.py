@@ -29,7 +29,10 @@ class BotConfig:
   automation_cycles: int = 1
   auto_create_profiles: bool = False
   proxy_cooldown_seconds: int = 1800
+  ip_check_session_start: bool = False
+  ip_check_enabled: bool = False
   profile_count: int = 20
+  session_click_log_path: str = ""
   cursor_api_key: str = ""
   cursor_model: str = "composer-2.5"
   llm_api_key: str = ""

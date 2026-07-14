@@ -6,7 +6,14 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from config.bot_config import BotConfig
-from core.profile_status import ProfileStatus, UiStatusKey
+from core.profile_status import (
+  CAPTCHA_ELAPSED_KEYS,
+  ERROR_ELAPSED_KEYS,
+  ProfileStatus,
+  SESSION_ELAPSED_KEYS,
+  UiStatusKey,
+  short_error_detail,
+)
 from core.profile_worker import ProfileWorkerThread
 from core.proxy_scheduler import ProxyScheduler
 from services.adspower_manager import AdsPowerManager, ProfileSpec
@@ -25,6 +32,8 @@ class BotWorkerThread(QThread):
   profile_created = pyqtSignal(object)
   profile_deleted = pyqtSignal(str)
   finished_ok = pyqtSignal()
+  profile_finished = pyqtSignal(str, str)
+  target_click_logged = pyqtSignal()
   error = pyqtSignal(str)
 
   def __init__(
@@ -174,8 +183,14 @@ class BotWorkerThread(QThread):
   def _emit_log(self, message: str) -> None:
     self.log.emit(message)
 
-  def _emit_profile_update(self, profile: ProfileSpec, status: ProfileStatus, cooldown: int = 0) -> None:
-    key, text = status.to_ui(cooldown)
+  def _emit_profile_update(
+    self,
+    profile: ProfileSpec,
+    status: ProfileStatus,
+    cooldown: int = 0,
+    detail: str = "",
+  ) -> None:
+    key, text = status.to_ui(cooldown_seconds=cooldown, detail=detail)
     self.profile_update.emit(profile.profile_id, key, text)
 
   def _emit_ui_status(self, profile: ProfileSpec, status_key: str, display_text: str) -> None:
@@ -362,6 +377,7 @@ class BotWorkerThread(QThread):
       return None
     try:
       proxy_batch = [proxy] if proxy else []
+      self._emit_log(f"[Worker] Creating profile for auto run {run_number} via AdsPower API...")
       created = adspower.create_profiles_batch(
         proxies=proxy_batch,
         group_id=self.config.adspower_group_id,
@@ -369,6 +385,7 @@ class BotWorkerThread(QThread):
       )
       profile = created[0]
       self._created_profile_ids.add(profile.profile_id)
+      self._emit_profile_update(profile, ProfileStatus.CREATING_PROFILE)
       self._emit_log(f"[Worker] Created profile for auto run {run_number}: {profile.name} ({profile.profile_id})")
       return profile
     except Exception as exc:
@@ -407,7 +424,7 @@ class BotWorkerThread(QThread):
     )
     stop_event = threading.Event()
     self._profile_stop_events[profile.profile_id] = stop_event
-    self._emit_profile_update(profile, ProfileStatus.RUNNING)
+    self._emit_profile_update(profile, ProfileStatus.LAUNCHING)
     display_proxy_key = self._proxy_key_for_profile(profile)
     self._emit_log(f"[Worker] Launching {profile.name} via proxy {display_proxy_key}")
     if assigned_keywords is None:
@@ -429,14 +446,15 @@ class BotWorkerThread(QThread):
 
         serp_bot = SerpBot(self.config, self._emit_log)
 
-        def on_status(status: ProfileStatus) -> None:
-          self._emit_profile_update(profile, status)
-
         def on_ui_status(status_key: str, display_text: str) -> None:
           self._emit_ui_status(profile, status_key, display_text)
 
         def on_failure(failed_profile: ProfileSpec, context: str, exc: BaseException) -> None:
-          self._emit_profile_update(failed_profile, ProfileStatus.ERROR)
+          self._emit_profile_update(
+            failed_profile,
+            ProfileStatus.ERROR,
+            detail=short_error_detail(exc, context),
+          )
           if self._failure_callback:
             self._failure_callback(failed_profile.profile_id)
 
@@ -445,7 +463,6 @@ class BotWorkerThread(QThread):
           profile,
           stop_event=stop_event,
           keywords_override=assigned_keywords,
-          on_status=on_status,
           on_ui_status=on_ui_status,
           on_traffic=lambda total, delta: self.traffic_update.emit(
             profile.profile_id,
@@ -454,11 +471,16 @@ class BotWorkerThread(QThread):
           ),
           on_failure=on_failure,
           on_keyword_exhausted=lambda kw: self._on_keyword_exhausted(profile, kw),
+          on_target_click=self.target_click_logged.emit,
           on_session_cleanup=stop_profile_once,
         )
       except Exception as exc:
         self._emit_log(f"[Worker] Error on {profile.name}: {exc}")
-        self._emit_profile_update(profile, ProfileStatus.ERROR)
+        self._emit_profile_update(
+          profile,
+          ProfileStatus.ERROR,
+          detail=short_error_detail(exc, "launch"),
+        )
         outcome = "error"
       finally:
         should_delete = (
@@ -492,13 +514,15 @@ class BotWorkerThread(QThread):
       scheduler.mark_finished(proxy_key)
     self._profile_stop_events.pop(profile.profile_id, None)
 
-    if outcome == "success":
-      self._emit_profile_update(profile, ProfileStatus.SUCCESS)
-    elif outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
-      self._emit_profile_update(profile, ProfileStatus.ERROR)
+    if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
+      self._emit_profile_update(
+        profile,
+        ProfileStatus.ERROR,
+        detail=outcome.replace("_", " "),
+      )
     elif outcome == "stopped":
       self._emit_profile_update(profile, ProfileStatus.IDLE)
-    else:
+    elif outcome not in ("success", "not_found"):
       self._emit_profile_update(profile, ProfileStatus.IDLE)
 
     self._emit_profile_update(
@@ -510,6 +534,7 @@ class BotWorkerThread(QThread):
       f"[Worker] Proxy {display_proxy_key} cooldown started "
       f"({self.config.proxy_cooldown_seconds // 60} min)"
     )
+    self.profile_finished.emit(profile.profile_id, outcome)
 
   def _interruptible_sleep(self, seconds: float) -> None:
     end_time = time.time() + seconds
@@ -573,6 +598,8 @@ class ProfileController(QObject):
   profile_created = pyqtSignal(object)
   profile_deleted = pyqtSignal(str)
   global_finished = pyqtSignal()
+  profile_finished = pyqtSignal(str, str)
+  target_click_logged = pyqtSignal()
 
   def __init__(self, parent=None):
     super().__init__(parent)
@@ -584,6 +611,8 @@ class ProfileController(QObject):
     self._stop_events: Dict[str, threading.Event] = {}
     self._cooldown_until: Dict[str, float] = {}
     self._session_started_at: Dict[str, float] = {}
+    self._captcha_started_at: Dict[str, float] = {}
+    self._error_started_at: Dict[str, float] = {}
     self._status: Dict[str, ProfileStatus] = {}
     self._self_healer = None
     self._auto_healing_enabled = False
@@ -633,6 +662,8 @@ class ProfileController(QObject):
     self._global_worker.profiles_changed.connect(self.profiles_sync_requested.emit)
     self._global_worker.profile_created.connect(self.profile_created.emit)
     self._global_worker.profile_deleted.connect(self.profile_deleted.emit)
+    self._global_worker.profile_finished.connect(self.profile_finished.emit)
+    self._global_worker.target_click_logged.connect(self.target_click_logged.emit)
     self._global_worker.error.connect(lambda msg: self.log.emit(f"[Worker] {msg}"))
     self._global_worker.finished_ok.connect(self.global_finished.emit)
     self._global_worker.start()
@@ -682,8 +713,9 @@ class ProfileController(QObject):
     worker.profiles_changed.connect(self.profiles_sync_requested.emit)
     worker.profile_deleted.connect(self.profile_deleted.emit)
     worker.finished_profile.connect(self._on_profile_finished)
+    worker.target_click_logged.connect(self.target_click_logged.emit)
     self._profile_workers[profile_id] = worker
-    key, text = ProfileStatus.RUNNING.to_ui()
+    key, text = ProfileStatus.LAUNCHING.to_ui()
     self.profile_update.emit(profile_id, key, text)
     worker.start()
     self.log.emit(f"[Controller] Manual start: {profile.name}")
@@ -754,7 +786,12 @@ class ProfileController(QObject):
 
   def _map_status_key(self, profile_id: str, status_key: str) -> None:
     mapping = {
-      UiStatusKey.NORMAL.value: ProfileStatus.RUNNING,
+      UiStatusKey.CREATING_PROFILE.value: ProfileStatus.CREATING_PROFILE,
+      UiStatusKey.LAUNCHING.value: ProfileStatus.LAUNCHING,
+      UiStatusKey.CHECKING_IP.value: ProfileStatus.CHECKING_IP,
+      UiStatusKey.WARMING_UP.value: ProfileStatus.WARMING_UP,
+      UiStatusKey.SEARCHING.value: ProfileStatus.SEARCHING,
+      UiStatusKey.VISITING_SITE.value: ProfileStatus.VISITING_SITE,
       UiStatusKey.CAPTCHA.value: ProfileStatus.CAPTCHA_WAIT,
       UiStatusKey.CAPTCHA_MANUAL.value: ProfileStatus.CAPTCHA_MANUAL,
       UiStatusKey.ERROR.value: ProfileStatus.ERROR,
@@ -771,15 +808,12 @@ class ProfileController(QObject):
     self._profile_workers.pop(profile_id, None)
     self._clear_session_elapsed(profile_id)
 
-    if outcome == "success":
-      status = ProfileStatus.SUCCESS
-    elif outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
-      status = ProfileStatus.ERROR
-    else:
-      status = ProfileStatus.IDLE
-
-    key, text = status.to_ui()
-    self.profile_update.emit(profile_id, key, text)
+    if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
+      key, text = ProfileStatus.ERROR.to_ui(detail=outcome.replace("_", " "))
+      self.profile_update.emit(profile_id, key, text)
+    elif outcome != "success":
+      key, text = ProfileStatus.IDLE.to_ui()
+      self.profile_update.emit(profile_id, key, text)
 
     cooldown = self._config.proxy_cooldown_seconds if self._config else 1800
     self._cooldown_until[profile_id] = time.time() + cooldown
@@ -787,14 +821,7 @@ class ProfileController(QObject):
     self.profile_update.emit(profile_id, key, text)
     profile_name = profile.name if profile else profile_id
     self.log.emit(f"[Controller] {profile_name} finished ({outcome}), proxy cooldown started")
-
-  _ELAPSED_STATUS_KEYS = frozenset({
-    UiStatusKey.NORMAL.value,
-    UiStatusKey.CAPTCHA.value,
-    UiStatusKey.CAPTCHA_MANUAL.value,
-    UiStatusKey.SELF_HEALING.value,
-    UiStatusKey.ERROR.value,
-  })
+    self.profile_finished.emit(profile_id, outcome)
 
   def get_session_elapsed(self, profile_id: str) -> int:
     started = self._session_started_at.get(profile_id)
@@ -802,17 +829,40 @@ class ProfileController(QObject):
       return 0
     return max(0, int(time.time() - started))
 
+  def get_captcha_elapsed(self, profile_id: str) -> int:
+    started = self._captcha_started_at.get(profile_id)
+    if not started:
+      return 0
+    return max(0, int(time.time() - started))
+
+  def get_error_elapsed(self, profile_id: str) -> int:
+    started = self._error_started_at.get(profile_id)
+    if not started:
+      return 0
+    return max(0, int(time.time() - started))
+
   def _track_session_elapsed(self, profile_id: str, status_key: str, display_text: str) -> None:
     if status_key == UiStatusKey.CLOSED.value:
-      self._session_started_at.pop(profile_id, None)
+      self._clear_session_elapsed(profile_id)
       return
-    if status_key in self._ELAPSED_STATUS_KEYS:
+
+    if status_key in SESSION_ELAPSED_KEYS:
       self._session_started_at.setdefault(profile_id, time.time())
-      return
-    self._session_started_at.pop(profile_id, None)
+
+    if status_key in CAPTCHA_ELAPSED_KEYS:
+      self._captcha_started_at.setdefault(profile_id, time.time())
+    else:
+      self._captcha_started_at.pop(profile_id, None)
+
+    if status_key in ERROR_ELAPSED_KEYS:
+      self._error_started_at.setdefault(profile_id, time.time())
+    else:
+      self._error_started_at.pop(profile_id, None)
 
   def _clear_session_elapsed(self, profile_id: str) -> None:
     self._session_started_at.pop(profile_id, None)
+    self._captcha_started_at.pop(profile_id, None)
+    self._error_started_at.pop(profile_id, None)
 
   def get_cooldown_remaining(self, profile_id: str) -> int:
     until = self._cooldown_until.get(profile_id, 0)
@@ -829,6 +879,8 @@ class ProfileController(QObject):
       self._status.pop(profile_id, None)
       self._cooldown_until.pop(profile_id, None)
       self._session_started_at.pop(profile_id, None)
+      self._captcha_started_at.pop(profile_id, None)
+      self._error_started_at.pop(profile_id, None)
       self._profile_traffic_totals.pop(profile_id, None)
     if profile_ids:
       self.log.emit(f"[Controller] Removed {len(profile_ids)} profile(s) from local state")

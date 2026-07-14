@@ -37,6 +37,18 @@ class ProfileSpec:
       return "Win/Chrome"
     return "Unknown"
 
+  @property
+  def device_label(self) -> str:
+    os_type = (self.os_type or "Unknown").strip()
+    if not os_type:
+      return "Unknown"
+    lowered = os_type.lower()
+    if lowered == "macos":
+      return "macOS"
+    if lowered == "ios":
+      return "iOS"
+    return os_type[:1].upper() + os_type[1:]
+
 
 DEFAULT_PROXY_TYPE = "http"
 PROFILE_OS_POOL = ("Windows", "Android")
@@ -487,7 +499,7 @@ class AdsPowerManager:
         json.dumps({"last_index": current}, ensure_ascii=True, indent=2),
         encoding="utf-8",
       )
-    return f"serp-auto-{current:03d}"
+    return f"s-{current:03d}"
 
   def reset_profile_name_counter(self, start_index: int = 0) -> None:
     with self._name_counter_lock:

@@ -4,7 +4,7 @@ import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from config.bot_config import BotConfig
-from core.profile_status import ProfileStatus
+from core.profile_status import ProfileStatus, short_error_detail
 from services.adspower_manager import AdsPowerManager, ProfileSpec
 from services.serp_bot import SerpBot
 from utils.keyword_exclusion import KeywordExclusionStore
@@ -15,6 +15,7 @@ class ProfileWorkerThread(QThread):
   log = pyqtSignal(str)
   profile_update = pyqtSignal(str, str, str)
   traffic_update = pyqtSignal(str, str, int)
+  target_click_logged = pyqtSignal()
   keyword_excluded = pyqtSignal(str)
   profiles_changed = pyqtSignal()
   profile_deleted = pyqtSignal(str)
@@ -41,8 +42,13 @@ class ProfileWorkerThread(QThread):
   def _emit_log(self, message: str) -> None:
     self.log.emit(message)
 
-  def _emit_profile_update(self, status: ProfileStatus, cooldown: int = 0) -> None:
-    key, text = status.to_ui(cooldown)
+  def _emit_profile_update(
+    self,
+    status: ProfileStatus,
+    cooldown: int = 0,
+    detail: str = "",
+  ) -> None:
+    key, text = status.to_ui(cooldown_seconds=cooldown, detail=detail)
     self.profile_update.emit(self.profile.profile_id, key, text)
 
   def _emit_ui_status(self, status_key: str, display_text: str) -> None:
@@ -59,7 +65,10 @@ class ProfileWorkerThread(QThread):
     proxy_key = self._proxy_key()
 
     def on_failure(failed_profile: ProfileSpec, context: str, exc: BaseException) -> None:
-      self._emit_profile_update(ProfileStatus.ERROR)
+      self._emit_profile_update(
+        ProfileStatus.ERROR,
+        detail=short_error_detail(exc, context),
+      )
       if self._failure_callback:
         self._failure_callback(failed_profile.profile_id)
 
@@ -67,13 +76,13 @@ class ProfileWorkerThread(QThread):
     max_tunnel_attempts = 2
     for attempt in range(1, max_tunnel_attempts + 1):
       try:
+        self._emit_profile_update(ProfileStatus.LAUNCHING)
         ws_endpoint = adspower.start_profile(self.profile.profile_id)
         outcome = serp_bot.run_session(
           ws_endpoint,
           self.profile,
           stop_event=self.stop_event,
           keywords_override=assigned_keywords,
-          on_status=self._emit_profile_update,
           on_ui_status=self._emit_ui_status,
           on_traffic=lambda total, delta: self.traffic_update.emit(
             self.profile.profile_id,
@@ -82,10 +91,14 @@ class ProfileWorkerThread(QThread):
           ),
           on_failure=on_failure,
           on_keyword_exhausted=self._on_keyword_exhausted,
+          on_target_click=self.target_click_logged.emit,
         )
       except Exception as exc:
         self._emit_log(f"[{self.profile.name}] Error: {exc}")
-        self._emit_profile_update(ProfileStatus.ERROR)
+        self._emit_profile_update(
+          ProfileStatus.ERROR,
+          detail=short_error_detail(exc, "launch"),
+        )
         if self._failure_callback:
           self._failure_callback(self.profile.profile_id)
         outcome = "error"

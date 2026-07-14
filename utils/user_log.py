@@ -38,7 +38,7 @@ _KEYWORD_FOUND = re.compile(
   r"Found\s+(\S+)\s+at page (\d+), rank (\d+) for '(.+?)'",
   re.IGNORECASE,
 )
-_IP_CAPTURED = re.compile(r"Session baseline IP captured:\s*(\S+)", re.IGNORECASE)
+_IP_CAPTURED = re.compile(r"Proxy IP captured:\s*(\S+)", re.IGNORECASE)
 
 
 def _split_profile(message: str) -> tuple[Optional[str], str]:
@@ -118,14 +118,14 @@ def format_user_log(message: str) -> Optional[str]:
 
   if tag == "IP":
     if "Checking proxy IP" in payload or "Checking IP" in payload:
-      return _fmt(profile, "Checking IP...")
+      return _fmt(profile, "Checking proxy IP...")
     ip_match = _IP_CAPTURED.search(payload)
     if ip_match:
-      return _fmt(profile, f"IP confirmed: {ip_match.group(1)}")
-    if "Could not capture session baseline IP" in payload:
-      return _fmt(profile, "Failed - IP check unavailable")
+      return _fmt(profile, f"Proxy IP confirmed: {ip_match.group(1)}")
+    if "Could not capture proxy IP" in payload:
+      return _fmt(profile, "Failed - proxy IP check unavailable")
     if "Session IP changed before keyword 2" in payload:
-      return _fmt(profile, "Failed - IP changed mid-session")
+      return _fmt(profile, "Failed - proxy IP changed mid-session")
     return None
 
   if tag == "Warmup" and re.search(r"Running \d+ warm-up", payload, re.IGNORECASE):
