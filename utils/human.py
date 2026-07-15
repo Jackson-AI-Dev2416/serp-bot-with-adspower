@@ -1,6 +1,6 @@
 import random
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from playwright.sync_api import Locator, Page
 
@@ -29,24 +29,32 @@ def _neighbor_typo(ch: str) -> str:
 _touch_sessions: set[int] = set()
 
 
-def enable_mobile_touch(page: Page) -> None:
+def _apply_mobile_touch_cdp(page: Page) -> None:
+    client = page.context.new_cdp_session(page)
+    client.send(
+        "Emulation.setTouchEmulationEnabled",
+        {"enabled": True, "maxTouchPoints": random.choice((5, 10))},
+    )
+    client.send(
+        "Emulation.setEmitTouchEventsForMouse",
+        {"enabled": True, "configuration": "mobile"},
+    )
+
+
+def enable_mobile_touch(page: Page, timeout_seconds: float = 8.0) -> bool:
     """Enable CDP touch emulation once per browser context (AdsPower CDP has no hasTouch)."""
+    del timeout_seconds  # kept for call-site compatibility; CDP must run on the Playwright thread
     context_id = id(page.context)
     if context_id in _touch_sessions:
-        return
+        return True
+    if page.is_closed():
+        return False
     try:
-        client = page.context.new_cdp_session(page)
-        client.send(
-            "Emulation.setTouchEmulationEnabled",
-            {"enabled": True, "maxTouchPoints": random.choice((5, 10))},
-        )
-        client.send(
-            "Emulation.setEmitTouchEventsForMouse",
-            {"enabled": True, "configuration": "mobile"},
-        )
+        _apply_mobile_touch_cdp(page)
         _touch_sessions.add(context_id)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _pick_touch_point(box: dict) -> tuple[float, float]:
@@ -63,9 +71,56 @@ def _pick_touch_point(box: dict) -> tuple[float, float]:
     return random.uniform(x_lo, x_hi), random.uniform(y_lo, y_hi)
 
 
-def dispatch_touch_tap(page: Page, x: float, y: float) -> None:
-    """Fire a human-like touch tap via CDP (works on AdsPower mobile profiles)."""
-    enable_mobile_touch(page)
+def get_viewport_touch_metrics(page: Page) -> dict:
+    try:
+        metrics = page.evaluate(
+            """() => ({
+              width: window.innerWidth || 0,
+              height: window.innerHeight || 0,
+              devicePixelRatio: window.devicePixelRatio || 1,
+            })"""
+        )
+        if isinstance(metrics, dict):
+            return metrics
+    except Exception:
+        pass
+    return {"width": 0, "height": 0, "devicePixelRatio": 1.0}
+
+
+def pick_touch_point_from_box(box: dict, strategy: str) -> tuple[float, float]:
+    bx = float(box.get("x") or 0)
+    by = float(box.get("y") or 0)
+    bw = max(float(box.get("width") or 0), 1.0)
+    bh = max(float(box.get("height") or 0), 1.0)
+    if strategy == "upper_30":
+        return bx + bw * 0.5, by + bh * 0.30
+    if strategy == "title_bias":
+        return bx + bw * 0.35, by + bh * 0.25
+    return bx + bw * 0.5, by + bh * 0.5
+
+
+def _log_touch_tap_attempt(
+    logger: Optional[Callable[[str], None]],
+    label: str,
+    attempt: int,
+    strategy: str,
+    x: float,
+    y: float,
+    metrics: dict,
+    *,
+    coord_mode: str = "css",
+) -> None:
+    if not logger:
+        return
+    logger(
+        f"[Touch] {label} attempt={attempt}/3 strategy={strategy} "
+        f"coords={coord_mode} x={x:.1f} y={y:.1f} "
+        f"viewport={int(metrics.get('width') or 0)}x{int(metrics.get('height') or 0)} "
+        f"dpr={float(metrics.get('devicePixelRatio') or 1.0):.2f}"
+    )
+
+
+def _fire_touch_at(page: Page, x: float, y: float) -> None:
     client = page.context.new_cdp_session(page)
     radius = random.uniform(9.0, 16.0)
     force = random.uniform(0.35, 0.85)
@@ -99,6 +154,217 @@ def dispatch_touch_tap(page: Page, x: float, y: float) -> None:
         page.wait_for_timeout(hold_ms // 2)
     client.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
     page.wait_for_timeout(random.randint(40, 120))
+
+
+def dispatch_touch_tap(
+    page: Page,
+    x: float,
+    y: float,
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+    label: str = "",
+) -> None:
+    """Fire a human-like touch tap via CDP (works on AdsPower mobile profiles)."""
+    enable_mobile_touch(page)
+    if logger and label:
+        metrics = get_viewport_touch_metrics(page)
+        logger(
+            f"[Touch] {label} tap x={x:.1f} y={y:.1f} "
+            f"viewport={int(metrics.get('width') or 0)}x{int(metrics.get('height') or 0)} "
+            f"dpr={float(metrics.get('devicePixelRatio') or 1.0):.2f}"
+        )
+    _fire_touch_at(page, x, y)
+
+
+def _locator_hit_at_point(locator: Locator, x: float, y: float) -> bool:
+    try:
+        return bool(
+            locator.evaluate(
+                """(el, coords) => {
+                  const [px, py] = coords;
+                  const hit = document.elementFromPoint(px, py);
+                  if (!hit) return false;
+                  const anchor = el.closest ? (el.closest('a') || el) : el;
+                  return anchor === hit || anchor.contains(hit) || hit.contains(anchor);
+                }""",
+                [float(x), float(y)],
+            )
+        )
+    except Exception:
+        return False
+
+
+def _navigation_left_serp(page: Page) -> bool:
+    try:
+        url = (page.url or "").lower()
+        if not url or url.startswith("about:"):
+            return False
+        return "google." not in url
+    except Exception:
+        return False
+
+
+def _poll_landed_after_tap(
+    page: Page,
+    landed_check: Optional[Callable[[], bool]],
+    *,
+    max_wait_ms: int = 12000,
+    poll_ms: int = 250,
+) -> bool:
+    if not landed_check:
+        return False
+    deadline = time.monotonic() + max(500, max_wait_ms) / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            if landed_check():
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(poll_ms)
+    try:
+        return bool(landed_check())
+    except Exception:
+        return False
+
+
+def _resolve_touch_outcome(
+    page: Page,
+    landed_check: Optional[Callable[[], bool]],
+    logger: Optional[Callable[[str], None]],
+    label: str,
+    *,
+    success_note: str,
+) -> bool:
+    if _poll_landed_after_tap(page, landed_check):
+        if logger:
+            logger(f"[Touch] {label} success {success_note}")
+        return True
+    if _navigation_left_serp(page):
+        if logger:
+            logger(
+                f"[Touch] {label} left Google SERP but target not confirmed "
+                f"(url={(page.url or '')[:100]})"
+            )
+    return False
+
+
+def dispatch_serp_anchor_touch_tap(
+    page: Page,
+    locator: Locator,
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+    label: str = "serp-target",
+    landed_check: Optional[Callable[[], bool]] = None,
+    delay_lo: float = 0.3,
+    delay_hi: float = 0.5,
+) -> bool:
+    """CDP touch tap on a SERP result anchor with scroll, bbox refresh, and retries."""
+    enable_mobile_touch(page, timeout_seconds=10.0)
+    random_delay(delay_lo, delay_hi)
+    try:
+        locator.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    page.wait_for_timeout(random.randint(250, 520))
+    scroll_page(page, random.randint(90, 220), mobile=True)
+    page.wait_for_timeout(random.randint(150, 320))
+    try:
+        locator.scroll_into_view_if_needed(timeout=4000)
+    except Exception:
+        pass
+    page.wait_for_timeout(random.randint(180, 380))
+
+    metrics = get_viewport_touch_metrics(page)
+    dpr = float(metrics.get("devicePixelRatio") or 1.0)
+    strategies = ("center", "upper_30", "title_bias")
+    bbox_timeout_ms = 2000
+
+    for attempt, strategy in enumerate(strategies, start=1):
+        if landed_check and landed_check():
+            if logger:
+                logger(f"[Touch] {label} success (already on target before tap)")
+            return True
+        if _navigation_left_serp(page):
+            return _resolve_touch_outcome(
+                page, landed_check, logger, label, success_note="(navigation already in progress)",
+            )
+
+        try:
+            box = locator.bounding_box(timeout=bbox_timeout_ms)
+        except Exception:
+            if landed_check and landed_check():
+                return _resolve_touch_outcome(
+                    page, landed_check, logger, label, success_note="after bbox timeout",
+                )
+            if _navigation_left_serp(page):
+                return _resolve_touch_outcome(
+                    page, landed_check, logger, label, success_note="after navigation started",
+                )
+            if logger:
+                logger(
+                    f"[Touch] {label} attempt={attempt}/3 strategy={strategy} "
+                    f"— bounding box unavailable"
+                )
+            continue
+
+        if not box or box.get("width", 0) < 2 or box.get("height", 0) < 2:
+            if logger:
+                logger(f"[Touch] {label} attempt={attempt}/3 strategy={strategy} — no bounding box")
+            continue
+
+        css_x, css_y = pick_touch_point_from_box(box, strategy)
+        coord_modes: list[tuple[str, float, float]] = [("css", css_x, css_y)]
+        if dpr > 1.01:
+            coord_modes.append(("dpr", css_x * dpr, css_y * dpr))
+
+        for coord_mode, tap_x, tap_y in coord_modes:
+            if landed_check and landed_check():
+                return _resolve_touch_outcome(
+                    page, landed_check, logger, label, success_note="before tap dispatch",
+                )
+            if _navigation_left_serp(page):
+                return _resolve_touch_outcome(
+                    page, landed_check, logger, label, success_note="before tap dispatch",
+                )
+
+            _log_touch_tap_attempt(
+                logger, label, attempt, strategy, tap_x, tap_y, metrics, coord_mode=coord_mode,
+            )
+            if coord_mode == "css" and not _locator_hit_at_point(locator, tap_x, tap_y):
+                if logger:
+                    logger(
+                        f"[Touch] {label} attempt={attempt}/3 strategy={strategy} "
+                        f"— elementFromPoint miss at css ({tap_x:.1f},{tap_y:.1f})"
+                    )
+            try:
+                dispatch_touch_tap(page, tap_x, tap_y)
+            except Exception as exc:
+                if logger:
+                    logger(f"[Touch] {label} dispatch failed: {exc}")
+                if landed_check and landed_check():
+                    return _resolve_touch_outcome(
+                        page, landed_check, logger, label, success_note="after dispatch error",
+                    )
+                if _navigation_left_serp(page):
+                    return _resolve_touch_outcome(
+                        page, landed_check, logger, label, success_note="after dispatch error",
+                    )
+                continue
+
+            if _resolve_touch_outcome(
+                page,
+                landed_check,
+                logger,
+                label,
+                success_note=f"via {strategy}/{coord_mode} ({tap_x:.1f},{tap_y:.1f})",
+            ):
+                return True
+
+    if landed_check and landed_check():
+        return _resolve_touch_outcome(
+            page, landed_check, logger, label, success_note="after all tap attempts",
+        )
+    return False
 
 
 def human_touch_click(
@@ -407,7 +673,14 @@ def human_click(
             human_touch_click(page, locator, delay_lo, delay_hi)
             return
         except Exception:
-            pass
+            try:
+                random_delay(delay_lo, delay_hi)
+                locator.scroll_into_view_if_needed(timeout=3000)
+                locator.click(timeout=5000, force=True)
+                random_delay(delay_lo, delay_hi)
+                return
+            except Exception:
+                pass
 
     random_delay(delay_lo, delay_hi)
     click_mods = list(modifiers or [])

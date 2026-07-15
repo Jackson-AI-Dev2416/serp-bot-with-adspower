@@ -101,7 +101,6 @@ class BotWorkerThread(QThread):
       event.set()
       if not global_stop:
         self._emit_log(f"[Worker] Stop requested for profile {profile_id}")
-    self._ensure_shutdown_waiter()
     return True
 
   def _ensure_shutdown_waiter(self) -> None:
@@ -154,6 +153,7 @@ class BotWorkerThread(QThread):
     )
     for profile_id in list(self._profile_stop_events.keys()):
       self._request_profile_stop(profile_id, global_stop=True)
+    self._ensure_shutdown_waiter()
 
   def request_profile_pause(self, profile_id: str) -> bool:
     """Gracefully stop one running profile without stopping the automation loop."""
@@ -428,6 +428,11 @@ class BotWorkerThread(QThread):
     max_concurrent = max(1, int(self.config.automation_threads or 1))
     proxy_list = list(self.config.proxies or [])
     proxy_cursor = 0
+    if proxy_list:
+      random.shuffle(proxy_list)
+      self._emit_log(
+        f"[Worker] Proxy list shuffled for this run ({len(proxy_list)} proxy/proxies)"
+      )
     keywords = [keyword.strip() for keyword in (self.config.keywords or []) if keyword and keyword.strip()]
     if not keywords:
       self._emit_log("[Worker] Auto-create mode aborted: no keywords configured.")
@@ -553,6 +558,7 @@ class BotWorkerThread(QThread):
         proxies=proxy_batch,
         group_id=self.config.adspower_group_id,
         total=1,
+        profile_os_mode=self.config.profile_os_mode,
       )
       profile = created[0]
       self._created_profile_ids.add(profile.profile_id)

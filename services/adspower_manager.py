@@ -56,6 +56,9 @@ class ProfileSpec:
 
 DEFAULT_PROXY_TYPE = "http"
 PROFILE_OS_POOL = ("Windows", "Android")
+PROFILE_OS_MODE_MIXED = "mixed"
+PROFILE_OS_MODE_ANDROID_ONLY = "android_only"
+PROFILE_OS_MODE_WINDOWS_ONLY = "windows_only"
 PROFILE_BROWSER = "chrome"
 
 
@@ -410,11 +413,22 @@ class AdsPowerManager:
         found.append(profile_id)
     return found
 
+  @staticmethod
+  def resolve_profile_os_pool(profile_os_mode: str = PROFILE_OS_MODE_MIXED) -> tuple[str, ...]:
+    normalized = (profile_os_mode or PROFILE_OS_MODE_MIXED).strip().lower()
+    if normalized in (PROFILE_OS_MODE_ANDROID_ONLY, "android"):
+      return ("Android",)
+    if normalized in (PROFILE_OS_MODE_WINDOWS_ONLY, "windows"):
+      return ("Windows",)
+    return PROFILE_OS_POOL
+
   def create_profiles_batch(
     self,
     proxies: List[Tuple[str, int, str, str]],
     group_id: str = "0",
     total: int = 20,
+    *,
+    profile_os_mode: str = PROFILE_OS_MODE_MIXED,
   ) -> List[ProfileSpec]:
     self._ensure_api_key()
     if total < 1:
@@ -429,12 +443,14 @@ class AdsPowerManager:
     if use_no_proxy:
       self.logger("[AdsPower] No proxies configured — creating profiles with no_proxy (test mode).")
 
-    os_plan = self._build_os_plan(total)
-    os_mix = {os_name: os_plan.count(os_name) for os_name in PROFILE_OS_POOL}
+    os_pool = self.resolve_profile_os_pool(profile_os_mode)
+    os_plan = self._build_os_plan(total, os_pool=os_pool)
+    os_mix = {os_name: os_plan.count(os_name) for os_name in os_pool}
+    mode_label = (profile_os_mode or PROFILE_OS_MODE_MIXED).strip().lower()
     self.logger(
       "[AdsPower] OS mix for batch: "
       + ", ".join(f"{name}={count}" for name, count in os_mix.items() if count)
-      + f" (browser={PROFILE_BROWSER})"
+      + f" (browser={PROFILE_BROWSER}, mode={mode_label})"
     )
 
     specs: List[ProfileSpec] = []
@@ -540,8 +556,14 @@ class AdsPowerManager:
     return list(proxies[:total])
 
   @staticmethod
-  def _build_os_plan(total: int) -> List[str]:
-    pool = list(PROFILE_OS_POOL)
+  def _build_os_plan(
+    total: int,
+    *,
+    os_pool: tuple[str, ...] = PROFILE_OS_POOL,
+  ) -> List[str]:
+    pool = list(os_pool or PROFILE_OS_POOL)
+    if not pool:
+      pool = list(PROFILE_OS_POOL)
     if total <= 0:
       return []
     if total == 1:

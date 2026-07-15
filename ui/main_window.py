@@ -976,6 +976,15 @@ class UiMainWindow(QMainWindow):
       "Each profile runs this many keywords, then closes. "
       "Next profile continues from the next keyword batch."
     )
+    self.profile_os_mode_combo = QComboBox()
+    self.profile_os_mode_combo.addItem("Mixed (Windows + Android)", "mixed")
+    self.profile_os_mode_combo.addItem("Windows", "windows_only")
+    self.profile_os_mode_combo.addItem("Android", "android_only")
+    self.profile_os_mode_combo.setToolTip(
+      "AdsPower profile OS for Create Profiles and Start Automation.\n"
+      "Mixed: random Windows/Android per profile.\n"
+      "Windows / Android: create only that device type."
+    )
     target_form.addRow("Target Domains (max 5):", self.target_domains_edit)
     target_form.addRow("Next Profile Launch Interval (sec):", self._wrap_row(launch_row))
     target_form.addRow("Target Site Dwell Time (sec):", self._wrap_row(dwell_row))
@@ -986,6 +995,7 @@ class UiMainWindow(QMainWindow):
     target_form.addRow("Action Delay (sec):", self._wrap_row(action_row))
     target_form.addRow("Max Search Pages:", self.max_search_pages)
     target_form.addRow("Max Keywords / Profile:", self.max_keywords_per_profile)
+    target_form.addRow("Profile OS Mode:", self.profile_os_mode_combo)
     self.chk_ip_check_session = QCheckBox("At session start")
     self.chk_ip_check_session.setChecked(False)
     self.chk_ip_check_session.setToolTip(
@@ -1818,6 +1828,27 @@ class UiMainWindow(QMainWindow):
       )
     return proxies
 
+  @staticmethod
+  def _normalize_profile_os_mode(value: str) -> str:
+    normalized = (value or "mixed").strip().lower()
+    if normalized in ("android", "android_only"):
+      return "android_only"
+    if normalized in ("windows", "windows_only", "win"):
+      return "windows_only"
+    return "mixed"
+
+  def _set_profile_os_mode_combo(self, value: str) -> None:
+    mode = self._normalize_profile_os_mode(value)
+    index = self.profile_os_mode_combo.findData(mode)
+    if index >= 0:
+      self.profile_os_mode_combo.setCurrentIndex(index)
+    else:
+      self.profile_os_mode_combo.setCurrentIndex(0)
+
+  def _profile_os_mode_from_ui(self) -> str:
+    data = self.profile_os_mode_combo.currentData()
+    return self._normalize_profile_os_mode(str(data or "mixed"))
+
   def _collect_settings_dict(self) -> dict:
     cursor_key = self.cursor_api_key.text().strip()
     cursor_model = self._cursor_model_value()
@@ -1847,6 +1878,7 @@ class UiMainWindow(QMainWindow):
       "ip_check_session_start": self.chk_ip_check_session.isChecked(),
       "ip_check_enabled": self.chk_ip_check_keyword2.isChecked(),
       "profile_count": self.profile_count_spin.value(),
+      "profile_os_mode": self._profile_os_mode_from_ui(),
       "automation_threads": self.threads_spin.value(),
       "automation_cycles": self.cycles_spin.value(),
       "proxies_text": self.proxies_edit.toPlainText(),
@@ -1892,6 +1924,7 @@ class UiMainWindow(QMainWindow):
     self.chk_ip_check_session.setChecked(bool(data.get("ip_check_session_start", False)))
     self.chk_ip_check_keyword2.setChecked(bool(data.get("ip_check_enabled", False)))
     self.profile_count_spin.setValue(int(data.get("profile_count", self.profile_count_spin.value())))
+    self._set_profile_os_mode_combo(str(data.get("profile_os_mode", "mixed")))
     self.threads_spin.setValue(int(data.get("automation_threads", self.threads_spin.value())))
     self.cycles_spin.setValue(int(data.get("automation_cycles", self.cycles_spin.value())))
     self.proxies_edit.setPlainText(data.get("proxies_text", ""))
@@ -2009,6 +2042,7 @@ class UiMainWindow(QMainWindow):
       automation_threads=self.threads_spin.value(),
       automation_cycles=self.cycles_spin.value(),
       profile_count=self.profile_count_spin.value(),
+      profile_os_mode=self._profile_os_mode_from_ui(),
       cursor_api_key=cursor_key,
       cursor_model=cursor_model,
       llm_api_key=cursor_key,
@@ -2256,6 +2290,18 @@ class UiMainWindow(QMainWindow):
     self.proxy_traffic_total_label.setText("0 B")
     self._controller.reset_session_traffic()
     self._profile_traffic_totals.clear()
+
+  def _reset_session_log(self) -> None:
+    """Truncate on-disk session logs and clear the live log panel for a fresh automation run."""
+    data_dir = self._project_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("session.log", "traffic_sessions.jsonl"):
+      try:
+        (data_dir / name).write_text("", encoding="utf-8")
+      except OSError as exc:
+        self.log_view.appendPlainText(f"[UI] Could not reset {name}: {exc}")
+        continue
+    self.log_view.clear()
 
   def _finalize_session_click_log(self) -> None:
     path = (self._session_click_log_path or "").strip()
@@ -2569,6 +2615,7 @@ class UiMainWindow(QMainWindow):
         config.proxies,
         config.adspower_group_id,
         total=config.profile_count,
+        profile_os_mode=config.profile_os_mode,
       )
       self._profiles = manager.list_profiles_live(group_id=config.adspower_group_id)
       self._populate_profile_table()
@@ -2624,6 +2671,7 @@ class UiMainWindow(QMainWindow):
     config.automation_threads = self.threads_spin.value()
     config.automation_cycles = self.cycles_spin.value()
     self.present_cycle_value_label.setText(f"0 / {config.automation_cycles}")
+    self._reset_session_log()
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
     self._reset_session_traffic()
@@ -2644,7 +2692,8 @@ class UiMainWindow(QMainWindow):
       self.append_log(
         f"[UI] Auto-create automation started: threads={config.automation_threads}, "
         f"cycles={config.automation_cycles}, "
-        f"launch interval {config.launch_interval_min}-{config.launch_interval_max}s."
+        f"launch interval {config.launch_interval_min}-{config.launch_interval_max}s, "
+        f"profile OS mode={config.profile_os_mode}."
       )
     else:
       self.append_log("[UI] Global bot is already running.")

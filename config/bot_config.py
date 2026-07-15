@@ -33,6 +33,7 @@ class BotConfig:
   ip_check_session_start: bool = False
   ip_check_enabled: bool = False
   profile_count: int = 20
+  profile_os_mode: str = "mixed"  # mixed | android_only | windows_only
   session_click_log_path: str = ""
   cursor_api_key: str = ""
   cursor_model: str = "composer-2.5"
