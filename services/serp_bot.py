@@ -4,7 +4,7 @@ import re
 import threading
 import time
 from typing import Callable, Optional, Tuple
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from playwright.sync_api import Browser, Page, sync_playwright
 
@@ -16,7 +16,17 @@ from services.google_consent import dismiss_google_consent, is_google_consent_pr
 from services.network_optimizer import NetworkOptimizer, PagePhase, classify_network_error
 from utils.crash_reporter import capture_exception
 from utils.csv_logger import CsvRankLogger, KeywordHistoryLogger, SessionClickCsvLogger
-from utils.human import enable_mobile_touch, human_click, human_type, micro_scroll, random_delay, scroll_page, dispatch_touch_tap
+from utils.human import (
+  dispatch_touch_tap,
+  enable_mobile_touch,
+  human_click,
+  human_keyboard_type,
+  human_type,
+  human_type_focus_safe,
+  micro_scroll,
+  random_delay,
+  scroll_page,
+)
 
 StatusCallback = Callable[[ProfileStatus], None]
 UiStatusCallback = Callable[[str, str], None]
@@ -27,6 +37,8 @@ TargetClickCallback = Callable[[], None]
 
 
 class SerpBot:
+  _MAX_TARGET_TRANSIENT_RETRIES = 3
+
   def __init__(self, config: BotConfig, logger: Callable[[str], None]):
     self.config = config
     self.logger = logger
@@ -35,13 +47,14 @@ class SerpBot:
     self._session_click_log: Optional[SessionClickCsvLogger] = None
     if (config.session_click_log_path or "").strip():
       self._session_click_log = SessionClickCsvLogger(config.session_click_log_path)
-    self.keyword_history = KeywordHistoryLogger(config.target_domain)
+    self.keyword_history = KeywordHistoryLogger(config.primary_target_domain)
     self._last_search_exhausted = False
     self._last_search_exhaustion_eligible = False
     self._session_network: Optional[NetworkOptimizer] = None
     self._mobile_serp_page = 1
     self._mobile_more_probe_done = False
     self._mobile_serp_end_reached = False
+    self._session_has_searched = False
 
   @staticmethod
   def _proxy_label(profile: ProfileSpec) -> str:
@@ -178,6 +191,7 @@ class SerpBot:
 
     log("[Session] Starting")
     self.captcha.reset_session_state()
+    self._session_has_searched = False
     self.captcha.set_session_logger(log)
     self.captcha.update_api_key(self.config.capsolver_api_key)
     proxy_label = self._proxy_label(profile)
@@ -186,8 +200,13 @@ class SerpBot:
       profile_name=profile.name,
       proxy=proxy_label,
     )
-    target_host = self._normalize_domain(self.config.target_domain)
-    network = NetworkOptimizer(target_host, log, profile_name=profile.name)
+    target_hosts = self.config.get_target_domains()
+    network = NetworkOptimizer(
+      self.config.primary_target_domain,
+      log,
+      profile_name=profile.name,
+      target_hosts=target_hosts,
+    )
     network.set_phase(PagePhase.GOOGLE_SERP)
     self._session_network = network
     if self.captcha.automated_mode:
@@ -246,7 +265,9 @@ class SerpBot:
         page = self._open_work_page(browser, profile, log)
         work_ref = None
         if not self._is_ios_profile(profile):
-          work_ref = self._attach_tab_guard(page.context, page, log)
+          work_ref = self._attach_tab_guard(
+            page.context, page, log, target_hosts=target_hosts,
+          )
         if page.is_closed():
           page = self._recover_work_page(page.context, profile, log)
           if work_ref is not None:
@@ -284,24 +305,13 @@ class SerpBot:
           page = work_ref["page"]
         page.on("response", handle_response)
 
-        opened_google, page = self._open_url_with_retry(
-          page,
-          "https://www.google.co.kr",
-          stopped=stopped,
-          profile=profile,
-          log=log,
-          max_wait_seconds=45.0,
-          purpose="initial-google",
-        )
+        page = self._sync_work_page(page, profile, log)
         if work_ref is not None:
           work_ref["page"] = page
-        if not opened_google:
-          log("[Start] Could not open Google within 45s after IP check.")
-          set_status(ProfileStatus.ERROR, detail="Google timeout")
-          if self._is_mobile_profile(profile):
-            return "error"
-          return "tunnel_error"
-        self._dismiss_google_consent(page, log)
+        log(
+          "[Start] Skipping Google homepage — warm-up via search URL / SERP box "
+          "(focus-safe; no address bar)."
+        )
         while True:
           if work_ref is not None and not work_ref["page"].is_closed():
             page = work_ref["page"]
@@ -359,6 +369,7 @@ class SerpBot:
             if current_ip:
               log(f"[IP] Session IP unchanged before keyword 2 ({current_ip})")
           keyword_grace_deadline = time.time() + 120.0 if index <= 2 else 0.0
+          transient_retries = 0
           while True:
             try:
               if work_ref is not None and not work_ref["page"].is_closed():
@@ -375,8 +386,17 @@ class SerpBot:
                 return guard
 
               page = self._sync_work_page(page, profile, log)
+              if not self._is_on_google_serp(page):
+                log(
+                  f"[Search] Recovering Google SERP before keyword ({index}/{len(keywords)}): "
+                  f"{keyword}"
+                )
+                page = self._recover_google_serp_before_search(
+                  page, keyword, profile, on_failure,
+                )
               on_keyword_serp = self._is_on_serp_for_keyword(page, keyword)
               on_any_serp = self._is_on_google_serp(page)
+              keyword_search_method = "serp_box"
               if on_keyword_serp:
                 set_status(ProfileStatus.SEARCHING)
                 log(
@@ -388,25 +408,27 @@ class SerpBot:
                 set_status(ProfileStatus.SEARCHING)
                 log(
                   f"Searching keyword ({index}/{len(keywords)}): {keyword} "
-                  "(from SERP search box after warm-up)"
+                  "(SERP search box)"
                 )
                 submit_search = True
+                keyword_search_method = "serp_box"
               else:
-                page = self._safe_goto(
-                  page,
-                  "https://www.google.co.kr",
-                  profile,
-                  log,
-                  wait_until="domcontentloaded",
-                  timeout=60000,
-                )
-                if work_ref is not None:
-                  work_ref["page"] = page
-                self._dismiss_google_consent(page, log)
                 set_status(ProfileStatus.SEARCHING)
-                log(f"Searching keyword ({index}/{len(keywords)}): {keyword}")
+                mobile = self._is_mobile_profile(profile)
+                if mobile:
+                  log(
+                    f"Searching keyword ({index}/{len(keywords)}): {keyword} "
+                    "(mobile cold-start search URL)"
+                  )
+                  keyword_search_method = "cold_start"
+                else:
+                  log(
+                    f"Searching keyword ({index}/{len(keywords)}): {keyword} "
+                    "(desktop cold-start search URL)"
+                  )
+                  keyword_search_method = "cold_start"
                 submit_search = True
-              match = self._search_target(
+              clicks = self._scan_keyword_serp(
                 page,
                 profile,
                 keyword,
@@ -417,16 +439,23 @@ class SerpBot:
                 on_failure,
                 log,
                 submit_search=submit_search,
+                search_method=keyword_search_method if submit_search else None,
+                work_ref=work_ref,
+                network=network,
+                handle_response=handle_response,
+                on_target_click=on_target_click,
               )
               if stopped():
                 return "stopped"
 
-              if not match:
+              if clicks <= 0:
                 if (
                   not self._last_search_exhaustion_eligible
                   and keyword_grace_deadline > 0
                   and time.time() < keyword_grace_deadline
+                  and transient_retries < 1
                 ):
+                  transient_retries += 1
                   remaining = max(0, int(keyword_grace_deadline - time.time()))
                   log(
                     f"[Retry] Keyword '{keyword}' ended before full SERP scan "
@@ -434,7 +463,7 @@ class SerpBot:
                   )
                   time.sleep(2.0)
                   continue
-                log(f"Target not found for '{keyword}'")
+                log(f"No target site clicks for '{keyword}'")
                 if on_keyword_exhausted and (
                   self._last_search_exhaustion_eligible or self._mobile_serp_end_reached
                 ):
@@ -446,65 +475,9 @@ class SerpBot:
                   )
                 break
 
-              page_num, rank, href = match
-              self._set_network_phase(PagePhase.TARGET_SITE, keyword, page)
-              opened = self._open_target_from_serp_click(
-                page,
-                href,
-                keyword=keyword,
-                profile=profile,
-                stop_event=stop_event,
-                stopped=stopped,
-                set_status=set_status,
-                on_ui_status=on_ui_status,
-                max_wait_seconds=45.0,
-              )
-              if stopped():
-                return "stopped"
-              if not opened:
-                log(
-                  f"[Target] Target site did not open within 45s after SERP click for '{keyword}'. "
-                  "Skipping keyword without re-search."
-                )
-                break
-
-              guard, page = self._ensure_captcha_clear(
-                page, stop_event, set_status, on_ui_status, profile, log, context="post-target-open",
-              )
-              if guard in self._captcha_abort_values():
-                set_status(ProfileStatus.ERROR)
-                return guard
-
-              visited_url = href or ""
-              try:
-                visited_url = (page.url or href or "").strip()
-              except Exception:
-                pass
-
-              self.csv.log(keyword, self.config.target_domain, page_num, rank, profile.name)
-              total_rank = ((page_num - 1) * 10) + rank
-              if self._session_click_log:
-                self._session_click_log.log(
-                  profile_name=profile.name,
-                  device=profile.device_label,
-                  keyword=keyword,
-                  url=visited_url,
-                  page=page_num,
-                  rank=rank,
-                  overall_rank=total_rank,
-                )
-                if on_target_click:
-                  on_target_click()
-              self.keyword_history.log(keyword, page_num, rank, total_rank)
-              log(f"Found {self.config.target_domain} at page {page_num}, rank {rank} for '{keyword}'")
               found_any = True
-              set_status(ProfileStatus.VISITING_SITE)
-              dwell_seconds = random.uniform(self.config.dwell_min, self.config.dwell_max)
-              log(f"[Target] Dwelling on site for {dwell_seconds:.0f}s")
-              self._dwell_on_site(page, dwell_seconds, stopped, profile)
-              self._set_network_phase(PagePhase.GOOGLE_SERP, keyword, page)
-              if stopped():
-                return "stopped"
+              if work_ref is not None and work_ref.get("page") is not None:
+                page = work_ref["page"]
               break
             except Exception as exc:
               page = self._sync_work_page(page, profile, log)
@@ -708,6 +681,101 @@ class SerpBot:
       return False
     return self._is_connection_error(exc)
 
+  @staticmethod
+  def _close_transient_extra_tabs(context, keep_pages: list[Page]) -> int:
+    keep = {tab for tab in keep_pages if tab is not None and not tab.is_closed()}
+    closed = 0
+    for tab in list(context.pages):
+      if tab in keep:
+        continue
+      try:
+        if tab.is_closed():
+          continue
+        if not SerpBot._is_transient_browser_tab_url(tab.url or ""):
+          continue
+        tab.close()
+        closed += 1
+      except Exception:
+        pass
+    return closed
+
+  def _wait_for_target_tab_ready(
+    self,
+    target_page: Page,
+    max_wait_seconds: float,
+  ) -> bool:
+    deadline = time.time() + max(5.0, float(max_wait_seconds))
+    while time.time() < deadline:
+      if target_page.is_closed():
+        return False
+      try:
+        host = self._normalize_domain(target_page.url or "")
+        if self._host_matches_any_target(host):
+          try:
+            target_page.bring_to_front()
+          except Exception:
+            pass
+          return True
+      except Exception:
+        pass
+      time.sleep(0.4)
+    return False
+
+  def _open_target_tab_direct(
+    self,
+    page: Page,
+    href: str,
+    profile: ProfileSpec,
+    max_wait_seconds: float = 45.0,
+    *,
+    reuse_tab: Optional[Page] = None,
+  ) -> Optional[Page]:
+    resolved = self._resolve_result_href(href) or (href or "").strip()
+    if not resolved:
+      return None
+    if resolved.startswith("/url?"):
+      resolved = f"https://www.google.co.kr{resolved}"
+    if not resolved.startswith("http"):
+      return None
+    context = page.context
+    target_page = reuse_tab
+    opening_new_tab = target_page is None or target_page.is_closed()
+    if opening_new_tab:
+      self.logger(f"[Target] Direct new-tab navigation: {resolved[:120]}")
+      try:
+        target_page = context.new_page()
+      except Exception as exc:
+        self.logger(f"[Target] Could not open target tab: {exc}")
+        return None
+    else:
+      self.logger(f"[Target] Retrying target navigation on same tab: {resolved[:120]}")
+    try:
+      target_page.goto(
+        resolved,
+        wait_until="domcontentloaded",
+        timeout=int(max(15000, max_wait_seconds * 1000)),
+      )
+    except Exception as exc:
+      self.logger(f"[Target] Direct target navigation warning: {exc}")
+    if self._wait_for_target_tab_ready(target_page, max_wait_seconds):
+      return target_page
+    if opening_new_tab and target_page and not target_page.is_closed():
+      try:
+        if self._is_transient_browser_tab_url(target_page.url or ""):
+          target_page.close()
+      except Exception:
+        pass
+    return None
+
+  @staticmethod
+  def _is_transient_browser_tab_url(url: str) -> bool:
+    lowered = (url or "").strip().lower()
+    return (
+      lowered in ("", "about:blank")
+      or lowered.startswith("chrome-error://")
+      or "chromewebdata" in lowered
+    )
+
   def _open_target_from_serp_click(
     self,
     page: Page,
@@ -719,17 +787,23 @@ class SerpBot:
     set_status: StatusCallback,
     on_ui_status: Optional[UiStatusCallback],
     max_wait_seconds: float = 45.0,
-  ) -> bool:
-    target_host = self._normalize_domain(self.config.target_domain)
+    *,
+    work_ref: Optional[dict] = None,
+    matched_domain: str = "",
+  ) -> tuple[bool, Page, Optional[Page]]:
+    expected_domain = matched_domain or self.config.primary_target_domain
     mobile = self._is_mobile_profile(profile)
+    serp_page: Optional[Page] = page if not mobile else None
+    if work_ref is not None:
+      work_ref["allow_target_tab_until"] = time.time() + max(70.0, float(max_wait_seconds) + 25.0)
 
     guard, page = self._guard_captcha(
       page, stop_event, set_status, on_ui_status, profile, self.logger,
     )
     if guard == "stopped":
-      return False
+      return False, page, serp_page
     if guard in ("error", "blocked"):
-      return False
+      return False, page, serp_page
 
     clicked = False
     link = self._find_result_link_for_href(page, href, mobile=mobile)
@@ -737,23 +811,169 @@ class SerpBot:
       try:
         raw_href = link.get_attribute("href") or href
         resolved = self._resolve_result_href(raw_href)
-        if not self._href_matches_target(resolved or href, self.config.target_domain):
+        if not self._href_matches_target(resolved or href, expected_domain):
           self.logger(
             f"[Target] Refusing SERP click — host mismatch "
             f"({self._normalize_domain(resolved or href)} vs "
-            f"{self._normalize_domain(self.config.target_domain)})"
+            f"{self._normalize_domain(expected_domain)})"
           )
           link = None
       except Exception:
         pass
-    if link:
+
+    if link and not mobile:
+      resolved_href = href
+      try:
+        raw_href = link.get_attribute("href") or href
+        resolved_href = self._resolve_result_href(raw_href) or href
+      except Exception:
+        pass
+      self.logger(
+        f"[Target] Opening target in new tab (focus-safe) for '{keyword}'"
+      )
+      transient_retries = 0
+      target_page = self._open_target_tab_direct(
+        page, resolved_href, profile, max_wait_seconds=max_wait_seconds,
+      )
+      if target_page:
+        self._close_transient_extra_tabs(
+          page.context,
+          [tab for tab in (page, target_page, serp_page) if tab is not None],
+        )
+        if work_ref is not None:
+          work_ref["allow_target_tab_until"] = 0.0
+        return True, target_page, serp_page
+      self.logger(
+        f"[Target] Direct new-tab open failed for '{keyword}' — trying Ctrl+click fallback"
+      )
+      try:
+        with page.context.expect_page(timeout=15000) as new_page_info:
+          human_click(
+            link,
+            self.config.action_delay_min,
+            self.config.action_delay_max,
+            page=page,
+            mobile=False,
+            modifiers=["Control"],
+          )
+        target_page = new_page_info.value
+        try:
+          target_page.wait_for_load_state("domcontentloaded", timeout=12000)
+        except Exception:
+          pass
+        deadline = time.time() + max(5.0, float(max_wait_seconds))
+        while time.time() < deadline:
+          if stopped():
+            return False, page, serp_page
+          if target_page.is_closed():
+            self.logger("[Target] Target tab was closed — reopening via direct navigation")
+            target_page = self._open_target_tab_direct(
+              page, resolved_href, profile, max_wait_seconds=max_wait_seconds,
+            )
+            if target_page:
+              self._close_transient_extra_tabs(
+                page.context,
+                [tab for tab in (page, target_page, serp_page) if tab is not None],
+              )
+              if work_ref is not None:
+                work_ref["allow_target_tab_until"] = 0.0
+              return True, target_page, serp_page
+            return False, page, serp_page
+          try:
+            tab_url = target_page.url or ""
+            if self._is_transient_browser_tab_url(tab_url):
+              transient_retries += 1
+              if transient_retries > self._MAX_TARGET_TRANSIENT_RETRIES:
+                self.logger(
+                  f"[Target] Target tab still transient after {transient_retries} retries "
+                  f"({tab_url[:80]}) — giving up"
+                )
+                try:
+                  if not target_page.is_closed():
+                    target_page.close()
+                except Exception:
+                  pass
+                return False, page, serp_page
+              self.logger(
+                f"[Target] New tab stuck on transient URL ({tab_url[:80]}) "
+                "— retrying on same tab"
+              )
+              target_page = self._open_target_tab_direct(
+                page,
+                resolved_href,
+                profile,
+                max_wait_seconds=max_wait_seconds,
+                reuse_tab=target_page,
+              )
+              if target_page:
+                self._close_transient_extra_tabs(
+                  page.context,
+                  [tab for tab in (page, target_page, serp_page) if tab is not None],
+                )
+                if work_ref is not None:
+                  work_ref["allow_target_tab_until"] = 0.0
+                return True, target_page, serp_page
+              return False, page, serp_page
+            host = self._normalize_domain(tab_url)
+            if self._host_matches_any_target(host):
+              try:
+                target_page.bring_to_front()
+              except Exception:
+                pass
+              self._close_transient_extra_tabs(
+                page.context,
+                [tab for tab in (page, target_page, serp_page) if tab is not None],
+              )
+              if work_ref is not None:
+                work_ref["allow_target_tab_until"] = 0.0
+              return True, target_page, serp_page
+          except Exception:
+            pass
+          time.sleep(0.4)
+        self.logger(
+          f"[Target] Ctrl+click tab did not reach target within {max_wait_seconds:.0f}s "
+          f"— trying direct new-tab navigation"
+        )
+        if target_page and not target_page.is_closed():
+          try:
+            target_page.close()
+          except Exception:
+            pass
+        target_page = self._open_target_tab_direct(
+          page, resolved_href, profile, max_wait_seconds=max_wait_seconds,
+        )
+        if target_page:
+          self._close_transient_extra_tabs(
+            page.context,
+            [tab for tab in (page, target_page, serp_page) if tab is not None],
+          )
+          if work_ref is not None:
+            work_ref["allow_target_tab_until"] = 0.0
+          return True, target_page, serp_page
+        return False, page, serp_page
+      except Exception as exc:
+        self.logger(f"[Target] Ctrl+click failed for '{keyword}': {exc} — direct new-tab navigation")
+        target_page = self._open_target_tab_direct(
+          page, resolved_href, profile, max_wait_seconds=max_wait_seconds,
+        )
+        if target_page:
+          self._close_transient_extra_tabs(
+            page.context,
+            [tab for tab in (page, target_page, serp_page) if tab is not None],
+          )
+          if work_ref is not None:
+            work_ref["allow_target_tab_until"] = 0.0
+          return True, target_page, serp_page
+        return False, page, serp_page
+
+    if link and mobile:
       try:
         human_click(
           link,
           self.config.action_delay_min,
           self.config.action_delay_max,
           page=page,
-          mobile=mobile,
+          mobile=True,
         )
         clicked = True
       except Exception as exc:
@@ -762,6 +982,8 @@ class SerpBot:
         )
 
     if not clicked:
+      if not mobile:
+        return False, page, serp_page
       try:
         page = self._safe_goto(
           page,
@@ -772,9 +994,10 @@ class SerpBot:
           timeout=int(max_wait_seconds * 1000),
         )
         host = self._normalize_domain(page.url or "")
-        return bool(target_host and (host == target_host or host.endswith(f".{target_host}")))
+        ok = self._host_matches_any_target(host)
+        return ok, page, serp_page
       except Exception:
-        return False
+        return False, page, serp_page
 
     deadline = time.time() + max(5.0, float(max_wait_seconds))
     self.logger(
@@ -782,16 +1005,16 @@ class SerpBot:
     )
     while time.time() < deadline:
       if stopped():
-        return False
+        return False, page, serp_page
       page = self._sync_work_page(page, profile, self.logger)
       try:
         host = self._normalize_domain(page.url or "")
-        if target_host and (host == target_host or host.endswith(f".{target_host}")):
+        if self._host_matches_any_target(host):
           try:
             page.wait_for_load_state("domcontentloaded", timeout=8000)
           except Exception:
             pass
-          return True
+          return True, page, serp_page
       except Exception:
         pass
       time.sleep(0.5)
@@ -800,7 +1023,7 @@ class SerpBot:
       f"[Target] Target site did not open within {max_wait_seconds:.0f}s "
       f"after SERP click for '{keyword}'"
     )
-    return False
+    return False, page, serp_page
 
   def _open_url_with_retry(
     self,
@@ -869,20 +1092,26 @@ class SerpBot:
   ) -> None:
     if page.is_closed():
       return
-    try:
-      page.goto("about:blank", wait_until="commit", timeout=15000)
-    except Exception as exc:
-      if self._is_proxy_connection_error(exc):
-        log(f"[Start] Proxy warmup navigation retrying: {exc}")
-        time.sleep(2.0)
-        try:
-          page = self._recover_work_page(page.context, profile, log)
-          page.goto("about:blank", wait_until="commit", timeout=15000)
-        except Exception:
-          return
-      else:
+    for attempt in range(1, 3):
+      try:
+        page.bring_to_front()
+      except Exception:
+        pass
+      try:
+        page.goto("about:blank", wait_until="commit", timeout=15000)
+        page.wait_for_timeout(random.randint(900, 1600))
         return
-    page.wait_for_timeout(random.randint(900, 1600))
+      except Exception as exc:
+        if self._is_proxy_connection_error(exc) and attempt < 2:
+          log(f"[Start] Proxy warmup navigation retrying: {exc}")
+          time.sleep(2.0)
+          try:
+            page = self._recover_work_page(page.context, profile, log)
+          except Exception:
+            return
+          continue
+        log(f"[Start] Could not open blank tab for focus-safe warmup: {exc}")
+        return
 
   @staticmethod
   def _response_size_bytes(response) -> int:
@@ -1054,8 +1283,36 @@ class SerpBot:
     return closed
 
   @staticmethod
-  def _attach_tab_guard(context, work_page: Page, log: Callable[[str], None]) -> dict:
-    work_ref = {"page": work_page}
+  def _attach_tab_guard(
+    context,
+    work_page: Page,
+    log: Callable[[str], None],
+    *,
+    target_host: str = "",
+    target_hosts: list[str] | None = None,
+  ) -> dict:
+    work_ref = {"page": work_page, "serp_page": work_page, "allow_target_tab_until": 0.0}
+    normalized_hosts: list[str] = []
+    for raw in (target_hosts or []):
+      normalized = SerpBot._normalize_domain(raw)
+      if normalized and normalized not in normalized_hosts:
+        normalized_hosts.append(normalized)
+    if not normalized_hosts and target_host:
+      normalized = SerpBot._normalize_domain(target_host)
+      if normalized:
+        normalized_hosts.append(normalized)
+
+    def _is_target_tab(url: str) -> bool:
+      if not normalized_hosts:
+        return False
+      try:
+        host = SerpBot._normalize_domain(urlparse(url).netloc or "")
+      except Exception:
+        return False
+      return any(
+        host == normalized or host.endswith(f".{normalized}")
+        for normalized in normalized_hosts
+      )
 
     def on_new_tab(new_page: Page) -> None:
       current = work_ref["page"]
@@ -1067,6 +1324,13 @@ class SerpBot:
         if SerpBot._is_captcha_url(url):
           log(f"[Captcha] Keeping captcha tab open ({label})")
           work_ref["page"] = new_page
+          return
+        allow_until = float(work_ref.get("allow_target_tab_until") or 0)
+        if time.time() < allow_until:
+          log(f"[Tab] Allowing new tab during target open ({label})")
+          return
+        if _is_target_tab(url):
+          log(f"[Tab] Keeping target-site tab ({label})")
           return
         if current is None or current.is_closed():
           log(f"[Tab] Work tab was closed — adopting new tab ({label})")
@@ -1232,7 +1496,7 @@ class SerpBot:
       f"(configured {count_lo}-{count_hi}, SERP scroll only — no result clicks)"
     )
 
-    for query in queries:
+    for index, query in enumerate(queries, start=1):
       if stopped():
         return page
       self._set_network_phase(PagePhase.GOOGLE_SERP, query, page)
@@ -1246,22 +1510,39 @@ class SerpBot:
       warmup_max_ms = max(warmup_min_ms, int(self.config.warmup_dwell_max * 1000))
       stay_ms = random.randint(warmup_min_ms, warmup_max_ms)
       mobile = self._is_mobile_profile(profile)
+      if mobile:
+        if self._is_on_google_serp(page):
+          search_method = "serp_box"
+        else:
+          search_method = "cold_start"
+      elif self._is_on_google_serp(page):
+        search_method = "serp_box"
+      else:
+        search_method = "cold_start"
+        log("[Warmup] Desktop warm-up via search URL (focus-safe)")
+      search_ok = False
+      last_search_exc: Optional[BaseException] = None
       try:
-        page = self._google_search(page, query, profile, on_failure)
+        page = self._google_search(
+          page, query, profile, on_failure, method=search_method,
+        )
         guard, page = self._ensure_captcha_clear(
           page, stop_event, set_status, on_ui_status, profile, log, context="post-warmup-search",
         )
         if guard in self._captcha_abort_values():
           return page
         page = self._wait_for_serp_stable(page, log, timeout_seconds=8.0)
-        for _ in range(random.randint(2, 5)):
-          scroll_page(
-            page,
-            random.choice((-1, 1)) * random.randint(120, 420),
-            mobile=mobile,
-          )
-          random_delay(self.config.action_delay_min, self.config.action_delay_max)
+        search_ok = self._is_on_google_serp(page)
+        if search_ok:
+          for _ in range(random.randint(2, 5)):
+            scroll_page(
+              page,
+              random.choice((-1, 1)) * random.randint(120, 420),
+              mobile=mobile,
+            )
+            random_delay(self.config.action_delay_min, self.config.action_delay_max)
       except Exception as exc:
+        last_search_exc = exc
         self.logger(f"[Warmup] Search phase warning: {exc}")
         guard, page = self._ensure_captcha_clear(
           page, stop_event, set_status, on_ui_status, profile, log, context="warmup-search-error",
@@ -1269,10 +1550,29 @@ class SerpBot:
         if guard in ("stopped", "error", "blocked"):
           return page
 
-      self.logger(
-        f"[Warmup] SERP dwell started ({stay_ms // 1000}s, scroll only — staying on results page)"
-      )
-      self._micro_scroll_during_wait(page, stay_ms, stopped, profile)
+      if not search_ok and not self._is_on_google_serp(page):
+        if last_search_exc and self._is_connection_error(last_search_exc):
+          self.logger("[Warmup] Retrying warm-up search after connection error")
+          try:
+            page = self._google_search_via_url(page, query, profile, on_failure)
+            page = self._wait_for_serp_stable(page, log, timeout_seconds=8.0)
+            search_ok = self._is_on_google_serp(page)
+          except Exception as retry_exc:
+            self.logger(f"[Warmup] Warm-up search retry failed: {retry_exc}")
+
+      if search_ok and self._is_on_google_serp(page):
+        self.logger(
+          f"[Warmup] SERP dwell started ({stay_ms // 1000}s, scroll only — staying on results page)"
+        )
+        self._micro_scroll_during_wait(page, stay_ms, stopped, profile)
+      else:
+        self.logger(
+          "[Warmup] SERP not open after warm-up search — skipping dwell scroll "
+          f"({(page.url or '')[:90]})"
+        )
+        fallback_ms = min(stay_ms, 3000)
+        if fallback_ms > 0 and not stopped():
+          self._safe_page_wait(page, fallback_ms)
       if stopped():
         return page
 
@@ -1339,18 +1639,165 @@ class SerpBot:
       time.sleep(0.18)
     return page
 
-  def _submit_search_query(
+  def _ensure_page_focus(self, page: Page) -> None:
+    for attempt in range(3):
+      try:
+        page.bring_to_front()
+      except Exception:
+        pass
+      try:
+        viewport = page.viewport_size or {"width": 1280, "height": 800}
+        cx = max(8, int(viewport.get("width", 1280)) // 2)
+        cy = max(8, int(viewport.get("height", 800)) // 3)
+        page.mouse.click(cx, cy)
+        page.wait_for_timeout(random.randint(100, 200))
+      except Exception:
+        pass
+      page.wait_for_timeout(random.randint(150, 280))
+      if attempt >= 1:
+        break
+
+  def _focus_omnibox(self, page: Page, profile: ProfileSpec) -> None:
+    self._ensure_page_focus(page)
+    for shortcut in ("Alt+D", "Control+l"):
+      try:
+        page.keyboard.press(shortcut)
+        page.wait_for_timeout(random.randint(220, 420))
+      except Exception:
+        pass
+
+  def _recover_google_serp_before_search(
     self,
     page: Page,
     query: str,
     profile: ProfileSpec,
     on_failure: Optional[FailureCallback],
   ) -> Page:
+    if self._is_on_google_serp(page):
+      return page
+    current = (page.url or "")[:100]
+    self.logger(
+      f"[Search] Off Google SERP before '{query}' ({current}) — reloading search results"
+    )
+    return self._google_search_via_url(page, query, profile, on_failure)
+
+  def _google_search_serp_box(
+    self,
+    page: Page,
+    query: str,
+    profile: ProfileSpec,
+    on_failure: Optional[FailureCallback],
+  ) -> Page:
+    page = self._recover_google_serp_before_search(page, query, profile, on_failure)
+    type_lo, type_hi = self._search_type_delay_bounds()
+    mobile = self._is_mobile_profile(profile)
+    search_box = page.locator('textarea[name="q"], input[name="q"]').first
+    search_box.wait_for(state="visible", timeout=8000)
+    label = "Mobile" if mobile else "Desktop"
+    self.logger(f"[Search] {label} SERP search box: {query}")
+    human_type_focus_safe(
+      search_box,
+      query,
+      type_lo,
+      type_hi,
+      typo_chance=0.03,
+      min_length_for_typo=9,
+      page=page,
+      mobile=mobile,
+    )
+    if mobile:
+      try:
+        typed = (search_box.input_value(timeout=2000) or "").strip()
+        expected = query.strip()
+        if typed and typed != expected:
+          self.logger(
+            f"[Search] Mobile SERP box text mismatch after clear "
+            f"(got '{typed[:72]}', expected '{expected[:72]}') — cold-start URL fallback"
+          )
+          return self._google_search_via_url(page, query, profile, on_failure)
+      except Exception as exc:
+        self.logger(f"[Search] Mobile SERP box verify warning: {exc}")
+    return self._submit_search_query(
+      page,
+      query,
+      profile,
+      on_failure,
+      enter_wait_seconds=8.0,
+      search_box=search_box if not mobile else None,
+    )
+
+  def _google_search_mobile(
+    self,
+    page: Page,
+    query: str,
+    profile: ProfileSpec,
+    on_failure: Optional[FailureCallback],
+    *,
+    method: str = "auto",
+  ) -> Page:
+    """Android: SERP search box when on results; one cold-start URL from blank."""
+    if method in ("serp_box", "auto") and self._is_on_google_serp(page):
+      try:
+        return self._google_search_serp_box(page, query, profile, on_failure)
+      except Exception as exc:
+        if self._is_connection_error(exc):
+          raise
+        self.logger(f"[Search] Mobile SERP search box unavailable: {exc}")
+        if method == "serp_box":
+          raise
+
+    self.logger(f"[Search] Mobile cold-start search URL: {query}")
+    return self._google_search_via_url(page, query, profile, on_failure)
+
+  def _omnibox_search(
+    self,
+    page: Page,
+    query: str,
+    profile: ProfileSpec,
+    on_failure: Optional[FailureCallback],
+    *,
+    enter_wait_seconds: float = 8.0,
+  ) -> Page:
+    type_lo, type_hi = self._search_type_delay_bounds()
+    self._focus_omnibox(page, profile)
+    random_delay(type_lo * 0.25, type_hi * 0.45)
+    human_keyboard_type(
+      page,
+      query,
+      type_lo,
+      type_hi,
+      typo_chance=0.03,
+      min_length_for_typo=9,
+    )
+    return self._submit_search_query(
+      page,
+      query,
+      profile,
+      on_failure,
+      enter_wait_seconds=enter_wait_seconds,
+    )
+
+  def _submit_search_query(
+    self,
+    page: Page,
+    query: str,
+    profile: ProfileSpec,
+    on_failure: Optional[FailureCallback],
+    *,
+    enter_wait_seconds: float = 3.0,
+    search_box=None,
+  ) -> Page:
     type_lo, type_hi = self._search_type_delay_bounds()
     random_delay(type_lo * 0.35, type_hi * 0.55)
-    page.keyboard.press("Enter")
+    if search_box is not None:
+      try:
+        search_box.press("Enter")
+      except Exception:
+        page.keyboard.press("Enter")
+    else:
+      page.keyboard.press("Enter")
 
-    enter_deadline = time.time() + 3.0
+    enter_deadline = time.time() + max(2.0, float(enter_wait_seconds))
     while time.time() < enter_deadline:
       if self._url_on_serp_or_sorry(page.url or ""):
         break
@@ -1360,8 +1807,34 @@ class SerpBot:
         pass
       time.sleep(0.12)
     else:
-      self.logger("[Search] Enter did not open SERP within 3s — using direct search URL")
-      return self._google_search_via_url(page, query, profile, on_failure)
+      if enter_wait_seconds <= 5.0:
+        raise RuntimeError(
+          f"SERP did not open after typing '{query}' (no direct search URL fallback)"
+        )
+      self.logger(
+        f"[Search] Enter did not open SERP within {enter_wait_seconds:.0f}s — retrying submit"
+      )
+      random_delay(type_lo * 0.35, type_hi * 0.55)
+      if search_box is not None:
+        try:
+          search_box.press("Enter")
+        except Exception:
+          page.keyboard.press("Enter")
+      else:
+        page.keyboard.press("Enter")
+      retry_deadline = time.time() + max(4.0, float(enter_wait_seconds) * 0.75)
+      while time.time() < retry_deadline:
+        if self._url_on_serp_or_sorry(page.url or ""):
+          break
+        try:
+          page.wait_for_load_state("domcontentloaded", timeout=1200)
+        except Exception:
+          pass
+        time.sleep(0.12)
+      else:
+        raise RuntimeError(
+          f"SERP did not open after typing '{query}' (no direct search URL fallback)"
+        )
 
     return self._wait_for_serp_stable(page, self.logger, timeout_seconds=8.0)
 
@@ -1397,60 +1870,51 @@ class SerpBot:
       raise last_exc
     return None
 
-  def _google_search(self, page: Page, query: str, profile: ProfileSpec, on_failure: Optional[FailureCallback]) -> Page:
+  def _google_search(
+    self,
+    page: Page,
+    query: str,
+    profile: ProfileSpec,
+    on_failure: Optional[FailureCallback],
+    *,
+    method: str = "auto",
+  ) -> Page:
     self._dismiss_google_consent(page, self.logger)
     mobile = self._is_mobile_profile(profile)
-    type_lo, type_hi = self._search_type_delay_bounds()
+    resolved = method
+    if resolved == "auto":
+      if mobile:
+        resolved = "serp_box" if self._is_on_google_serp(page) else "cold_start"
+      elif self._is_on_google_serp(page):
+        resolved = "serp_box"
+      else:
+        resolved = "cold_start"
 
-    try:
-      if "google." not in (urlparse(page.url).netloc or "").lower():
-        page = self._safe_goto(
-          page,
-          "https://www.google.co.kr",
-          profile,
-          self.logger,
-          wait_until="domcontentloaded",
-          timeout=45000,
-        )
-        self._dismiss_google_consent(page, self.logger)
-    except Exception as exc:
-      if self._is_connection_error(exc):
-        raise
-      self.logger(f"[Search] Could not open Google homepage before typing: {exc}")
-
-    search_box = page.locator('textarea[name="q"], input[name="q"]').first
-    try:
-      search_box.wait_for(state="visible", timeout=5000)
-    except Exception:
+    if resolved == "serp_box":
+      self.logger(f"[Search] SERP search box query: {query}")
       try:
-        page = self._safe_goto(
-          page,
-          "https://www.google.co.kr",
-          profile,
-          self.logger,
-          wait_until="domcontentloaded",
-          timeout=45000,
-        )
-        self._dismiss_google_consent(page, self.logger)
-        search_box.wait_for(state="visible", timeout=5000)
+        page = self._google_search_serp_box(page, query, profile, on_failure)
       except Exception as exc:
         if self._is_connection_error(exc):
           raise
-        self.logger(f"[Search] Search box not available, falling back to direct URL: {exc}")
-        return self._google_search_via_url(page, query, profile, on_failure)
+        self.logger(f"[Search] SERP box failed, cold-start URL: {exc}")
+        page = self._google_search_via_url(page, query, profile, on_failure)
+    elif resolved == "cold_start":
+      if mobile:
+        page = self._google_search_mobile(page, query, profile, on_failure, method="cold_start")
+      else:
+        self.logger(f"[Search] Desktop cold-start search URL: {query}")
+        page = self._google_search_via_url(page, query, profile, on_failure)
+    elif resolved == "omnibox":
+      self.logger(
+        f"[Search] Address bar disabled (focus-safe) — using cold-start URL: {query}"
+      )
+      page = self._google_search_via_url(page, query, profile, on_failure)
+    else:
+      raise ValueError(f"Unknown search method: {method}")
 
-    self.logger(f"[Search] Typing query: {query}")
-    human_type(
-      search_box,
-      query,
-      type_lo,
-      type_hi,
-      typo_chance=0.03,
-      min_length_for_typo=9,
-      page=page,
-      mobile=mobile,
-    )
-    page = self._submit_search_query(page, query, profile, on_failure)
+    self._session_has_searched = True
+    self._dismiss_google_consent(page, self.logger)
     if self.captcha.requires_captcha_clear(page) or self._url_looks_like_captcha(page):
       self.logger(
         f"[Captcha] Post-search captcha signal detected (url={(page.url or '')[:120]})"
@@ -1619,15 +2083,25 @@ class SerpBot:
 
   def _find_result_link_for_href(self, page: Page, target_href: str, *, mobile: bool):
     normalized = self._normalize_domain(target_href)
+    target_domains = self._get_target_domains()
     for selector in self._organic_link_selectors(mobile):
       links = page.locator(selector)
-      for index in range(min(links.count(), 30)):
+      for index in range(min(links.count(), 140)):
         link = links.nth(index)
         raw_href = link.get_attribute("href") or ""
         resolved = self._resolve_result_href(raw_href)
         if not resolved:
           continue
-        if resolved == target_href or self._normalize_domain(resolved) == normalized:
+        if (
+          resolved == target_href
+          or self._normalize_domain(resolved) == normalized
+          or any(self._href_matches_target(resolved, domain) for domain in target_domains)
+        ):
+          try:
+            link.scroll_into_view_if_needed(timeout=5000)
+            page.wait_for_timeout(random.randint(120, 280))
+          except Exception:
+            pass
           return link
     return None
 
@@ -1731,7 +2205,241 @@ class SerpBot:
       return unquote(query) or href
     return href
 
-  def _search_target(
+  def _get_target_domains(self) -> list[str]:
+    return self.config.get_target_domains()
+
+  def _host_matches_any_target(self, host: str) -> bool:
+    normalized_host = (host or "").lower().removeprefix("www.")
+    if not normalized_host:
+      return False
+    for domain in self._get_target_domains():
+      target = self._normalize_domain(domain)
+      if target and (normalized_host == target or normalized_host.endswith(f".{target}")):
+        return True
+    return False
+
+  def _href_match_target_domain(self, href: str, targets: list[str]) -> Optional[str]:
+    for target in targets:
+      if self._href_matches_target(href, target):
+        return target
+    return None
+
+  def _serp_click_dedupe_key(self, href: str) -> str:
+    resolved = self._resolve_result_href(href) or href
+    try:
+      parsed = urlparse(resolved)
+      host = (parsed.netloc or "").lower().removeprefix("www.")
+      path = (parsed.path or "/").rstrip("/") or "/"
+      query = parsed.query or ""
+      return f"{host}{path}?{query}" if query else f"{host}{path}"
+    except Exception:
+      return (resolved or href).strip().lower()
+
+  def _collect_target_matches_on_page(
+    self,
+    result_hrefs: list[str],
+    clicked_keys: set[str],
+  ) -> list[tuple[int, str, str]]:
+    targets = self._get_target_domains()
+    matches: list[tuple[int, str, str]] = []
+    for rank, href in enumerate(result_hrefs, start=1):
+      matched_domain = self._href_match_target_domain(href, targets)
+      if not matched_domain:
+        continue
+      dedupe = self._serp_click_dedupe_key(href)
+      if dedupe in clicked_keys:
+        continue
+      matches.append((rank, href, matched_domain))
+    return matches
+
+  def _process_serp_match_click(
+    self,
+    page: Page,
+    profile: ProfileSpec,
+    keyword: str,
+    page_num: int,
+    rank: int,
+    href: str,
+    matched_domain: str,
+    *,
+    stop_event: Optional[threading.Event],
+    stopped: Callable[[], bool],
+    set_status: StatusCallback,
+    on_ui_status: Optional[UiStatusCallback],
+    on_failure: Optional[FailureCallback],
+    work_ref: Optional[dict],
+    network: Optional[NetworkOptimizer],
+    handle_response: Optional[Callable],
+    on_target_click: Optional[TargetClickCallback],
+    log: Callable[[str], None],
+  ) -> tuple[bool, Page]:
+    self._set_network_phase(PagePhase.TARGET_SITE, keyword, page)
+    if work_ref is not None:
+      work_ref["allow_target_tab_until"] = time.time() + 70.0
+    opened, page, serp_tab = self._open_target_from_serp_click(
+      page,
+      href,
+      keyword=keyword,
+      profile=profile,
+      stop_event=stop_event,
+      stopped=stopped,
+      set_status=set_status,
+      on_ui_status=on_ui_status,
+      max_wait_seconds=45.0,
+      work_ref=work_ref,
+      matched_domain=matched_domain,
+    )
+    if stopped():
+      return False, page
+    if not opened:
+      log(
+        f"[Target] Target site did not open within 45s after SERP click for '{keyword}' "
+        f"({matched_domain})."
+      )
+      return False, page
+
+    mobile = self._is_mobile_profile(profile)
+    if network is not None and handle_response is not None:
+      try:
+        page.on("response", handle_response)
+      except Exception:
+        pass
+      network.reattach_page(page, mobile=mobile)
+      network.apply_phase_headers(page)
+
+    guard, page = self._ensure_captcha_clear(
+      page, stop_event, set_status, on_ui_status, profile, log, context="post-target-open",
+    )
+    if guard in self._captcha_abort_values():
+      return False, page
+
+    visited_url = href or ""
+    try:
+      visited_url = (page.url or href or "").strip()
+    except Exception:
+      pass
+
+    self.csv.log(keyword, matched_domain, page_num, rank, profile.name)
+    total_rank = ((page_num - 1) * 10) + rank
+    if self._session_click_log:
+      self._session_click_log.log(
+        profile_name=profile.name,
+        device=profile.device_label,
+        keyword=keyword,
+        url=visited_url,
+        page=page_num,
+        rank=rank,
+        overall_rank=total_rank,
+      )
+      if on_target_click:
+        on_target_click()
+    self.keyword_history.log(
+      keyword, page_num, rank, total_rank, mobile=mobile,
+    )
+    log(f"Found {matched_domain} at page {page_num}, rank {rank} for '{keyword}'")
+    set_status(ProfileStatus.VISITING_SITE)
+    dwell_seconds = random.uniform(self.config.dwell_min, self.config.dwell_max)
+    log(f"[Target] Dwelling on site for {dwell_seconds:.0f}s")
+    self._dwell_on_site(page, dwell_seconds, stopped, profile)
+    set_status(ProfileStatus.SEARCHING)
+    self._set_network_phase(PagePhase.GOOGLE_SERP, keyword, page)
+
+    if serp_tab and not mobile:
+      try:
+        if page != serp_tab and not page.is_closed():
+          page.close()
+          log("[Target] Closed target tab — returning to SERP")
+      except Exception as exc:
+        log(f"[Target] Close target tab warning: {exc}")
+      page = serp_tab
+      if work_ref is not None:
+        work_ref["page"] = page
+        work_ref["serp_page"] = serp_tab
+      try:
+        page.bring_to_front()
+      except Exception:
+        pass
+      if network is not None:
+        network.reattach_page(page, mobile=False)
+        network.apply_phase_headers(page)
+    elif mobile:
+      try:
+        page.go_back(wait_until="domcontentloaded", timeout=20000)
+        page = self._wait_for_serp_stable(page, log, timeout_seconds=8.0)
+        if work_ref is not None:
+          work_ref["page"] = page
+        log("[Target] Returned to SERP via back navigation (mobile)")
+      except Exception as exc:
+        log(f"[Target] Mobile back to SERP warning: {exc}")
+        try:
+          page = self._recover_google_serp_before_search(page, keyword, profile, on_failure)
+          page = self._wait_for_serp_stable(page, log, timeout_seconds=8.0)
+          if work_ref is not None:
+            work_ref["page"] = page
+          log("[Target] Returned to SERP via search URL (mobile fallback)")
+        except Exception as fallback_exc:
+          log(f"[Target] Mobile SERP fallback failed: {fallback_exc}")
+
+    if work_ref is not None:
+      work_ref["allow_target_tab_until"] = 0.0
+    return True, page
+
+  def _process_page_target_matches(
+    self,
+    page: Page,
+    profile: ProfileSpec,
+    keyword: str,
+    served_page_num: int,
+    result_hrefs: list[str],
+    clicked_keys: set[str],
+    *,
+    stop_event: Optional[threading.Event],
+    stopped: Callable[[], bool],
+    set_status: StatusCallback,
+    on_ui_status: Optional[UiStatusCallback],
+    on_failure: Optional[FailureCallback],
+    work_ref: Optional[dict],
+    network: Optional[NetworkOptimizer],
+    handle_response: Optional[Callable],
+    on_target_click: Optional[TargetClickCallback],
+    log: Callable[[str], None],
+  ) -> tuple[int, Page]:
+    matches = self._collect_target_matches_on_page(result_hrefs, clicked_keys)
+    clicks = 0
+    if not matches:
+      return 0, page
+    self.logger(
+      f"[Search] Page {served_page_num}: {len(matches)} target match(es) for '{keyword}'"
+    )
+    for rank, href, matched_domain in matches:
+      if stopped():
+        break
+      dedupe = self._serp_click_dedupe_key(href)
+      clicked_keys.add(dedupe)
+      success, page = self._process_serp_match_click(
+        page,
+        profile,
+        keyword,
+        served_page_num,
+        rank,
+        href,
+        matched_domain,
+        stop_event=stop_event,
+        stopped=stopped,
+        set_status=set_status,
+        on_ui_status=on_ui_status,
+        on_failure=on_failure,
+        work_ref=work_ref,
+        network=network,
+        handle_response=handle_response,
+        on_target_click=on_target_click,
+        log=log,
+      )
+      if success:
+        clicks += 1
+    return clicks, page
+
+  def _scan_keyword_serp(
     self,
     page: Page,
     profile: ProfileSpec,
@@ -1744,27 +2452,29 @@ class SerpBot:
     log: Callable[[str], None],
     *,
     submit_search: bool = True,
-  ) -> Optional[Tuple[int, int, str]]:
+    search_method: Optional[str] = None,
+    work_ref: Optional[dict] = None,
+    network: Optional[NetworkOptimizer] = None,
+    handle_response: Optional[Callable] = None,
+    on_target_click: Optional[TargetClickCallback] = None,
+  ) -> int:
     self._last_search_exhausted = False
     self._last_search_exhaustion_eligible = False
-    target = self._normalize_domain(self.config.target_domain)
     self._set_network_phase(PagePhase.GOOGLE_SERP, keyword, page)
     max_pages = max(1, int(self.config.max_search_pages))
-    history_page = self.keyword_history.get_last_page_hint(keyword)
-    visited_result_pages: set[int] = set()
-    serp_last_page: Optional[int] = None
-    pages_with_results = 0
-    current_page: Optional[int] = None
+    clicked_keys: set[str] = set()
+    total_clicks = 0
 
     guard, page = self._guard_captcha(
       page, stop_event, set_status, on_ui_status, profile, log, context="search-results",
     )
     if guard in ("stopped", "error", "blocked"):
-      return None
+      return 0
     set_status(ProfileStatus.SEARCHING)
     mobile = self._is_mobile_profile(profile)
     if submit_search:
-      page = self._google_search(page, keyword, profile, on_failure)
+      method = search_method or "auto"
+      page = self._google_search(page, keyword, profile, on_failure, method=method)
     else:
       log(f"[Search] Continuing SERP scan for '{keyword}' without re-typing")
       page = self._wait_for_serp_stable(page, log)
@@ -1777,16 +2487,14 @@ class SerpBot:
       page, stop_event, set_status, on_ui_status, profile, log, context="post-google-search",
     )
     if guard in self._captcha_abort_values():
-      return None
+      return 0
 
     if mobile:
-      return self._search_target_mobile(
+      return self._scan_keyword_serp_mobile(
         page,
         profile,
         keyword,
-        target,
         max_pages,
-        history_page,
         stop_event,
         stopped,
         set_status,
@@ -1794,56 +2502,47 @@ class SerpBot:
         on_failure,
         log,
         submit_search=submit_search,
+        clicked_keys=clicked_keys,
+        work_ref=work_ref,
+        network=network,
+        handle_response=handle_response,
+        on_target_click=on_target_click,
       )
 
+    visited_result_pages: set[int] = set()
+    serp_last_page: Optional[int] = None
+    pages_with_results = 0
+    current_page: Optional[int] = None
     current_page = self._serp_page_num(page, profile)
     visible_serp_last_page = self._update_serp_last_page(
-      page, current_page, None, max_pages, profile, log, history_page=history_page,
+      page, current_page, None, max_pages, profile, log, history_page=None,
     )
-    serp_last_page = self._apply_serp_cap_floor(visible_serp_last_page, history_page, max_pages)
-    effective_cap = serp_last_page
-    search_order = self._build_search_order(max_pages, history_page, visible_serp_last_page)
-    order_note = (f" (history page {history_page})" if history_page else " (no history)")
-    planned_pages = [
-      page_num
-      for page_num in search_order
-      if not self._desktop_page_should_skip(
-        page_num,
-        max_pages=max_pages,
-        visible_serp_cap=visible_serp_last_page,
-        history_page=history_page,
-      )
-    ]
+    serp_last_page = visible_serp_last_page
+    search_order = list(range(1, max_pages + 1))
     self.logger(
-      f"[Search] order for '{keyword}': {planned_pages}"
-      + order_note
-      + f", SERP cap {visible_serp_last_page or 'unknown'}"
+      f"[Search] Sequential scan for '{keyword}': pages {search_order}, "
+      f"SERP cap {visible_serp_last_page or 'unknown'}"
     )
 
     for page_num in search_order:
       if stopped():
-        return None
+        return total_clicks
 
       effective_cap = min(max_pages, serp_last_page) if serp_last_page else max_pages
-      if self._desktop_page_should_skip(
-        page_num,
-        max_pages=max_pages,
-        visible_serp_cap=visible_serp_last_page,
-        history_page=history_page,
-      ):
+      if page_num > effective_cap:
         self.logger(
-          f"[Search] Skip page {page_num}; Google results end at page {visible_serp_last_page} "
-          f"(configured max {max_pages}) for '{keyword}'"
+          f"[Search] Stop at page {page_num}; Google results end at page {effective_cap} "
+          f"for '{keyword}'"
         )
-        continue
+        break
 
       if current_page != page_num:
         if not self._navigate_to_search_page(
           page, keyword, page_num, profile, stop_event, set_status, on_ui_status, on_failure, log,
         ):
-          return None
+          return total_clicks
         current_page = self._serp_page_num(page, profile)
-        if not mobile and current_page != page_num:
+        if current_page != page_num:
           self.logger(
             f"[Search] Desktop: landed on page {current_page}, expected {page_num} "
             f"— direct URL for '{keyword}'"
@@ -1854,125 +2553,91 @@ class SerpBot:
       served_page_num = current_page
       if served_page_num in visited_result_pages:
         if page_num > served_page_num:
-          self.logger(
-            f"[Search] Stuck on page {served_page_num} while requesting page {page_num} "
-            f"for '{keyword}' — trying direct URL"
-          )
           page = self._goto_search_page(page, keyword, page_num, profile, on_failure)
           current_page = self._serp_page_num(page, profile)
           served_page_num = current_page
         if served_page_num in visited_result_pages:
-          if page_num > served_page_num:
-            serp_last_page = min(serp_last_page or served_page_num, served_page_num)
-            self.logger(
-              f"[Search] Google has no page {page_num}; "
-              f"results end at page {serp_last_page} for '{keyword}'"
-            )
+          serp_last_page = min(serp_last_page or served_page_num, served_page_num)
           continue
       visited_result_pages.add(served_page_num)
 
       self._serp_micro_scroll(page, profile, times=1)
-
       serp_last_page = self._update_serp_last_page(
-        page, served_page_num, serp_last_page, max_pages, profile, log, history_page=history_page,
+        page, served_page_num, serp_last_page, max_pages, profile, log, history_page=None,
       )
-      visible_serp_last_page = min(
-        max_pages,
-        max(visible_serp_last_page or 1, serp_last_page or 1),
-      )
-      serp_last_page = self._apply_serp_cap_floor(serp_last_page, history_page, max_pages)
+      visible_serp_last_page = min(max_pages, max(visible_serp_last_page or 1, serp_last_page or 1))
 
       result_hrefs = self._collect_organic_result_hrefs_with_retry(
-        page,
-        served_page_num,
-        profile,
-        stop_event,
-        set_status,
-        on_ui_status,
-        log,
+        page, served_page_num, profile, stop_event, set_status, on_ui_status, log,
       )
       if result_hrefs is None:
-        return None
+        return total_clicks
       if not result_hrefs:
         if served_page_num == 1:
           self.logger(
             f"[Search] Page 1 returned no parseable results for '{keyword}' "
             "(transient/block — keyword kept in list)."
           )
-          return None
-        self.logger(f"[Search] No organic results on page {served_page_num}; stopping for '{keyword}'")
+          return total_clicks
         serp_last_page = min(serp_last_page or max(served_page_num - 1, 1), max(served_page_num - 1, 1))
-        break
+        visible_serp_last_page = min(visible_serp_last_page or serp_last_page, serp_last_page)
+        continue
 
       pages_with_results += 1
       self.logger(
         f"[Search] Page {served_page_num}: parsed {len(result_hrefs)} organic link(s) for '{keyword}'"
       )
-      for rank, href in enumerate(result_hrefs, start=1):
-        if self._href_matches_target(href, target):
-          return served_page_num, rank, href
+      page_clicks, page = self._process_page_target_matches(
+        page,
+        profile,
+        keyword,
+        served_page_num,
+        result_hrefs,
+        clicked_keys,
+        stop_event=stop_event,
+        stopped=stopped,
+        set_status=set_status,
+        on_ui_status=on_ui_status,
+        on_failure=on_failure,
+        work_ref=work_ref,
+        network=network,
+        handle_response=handle_response,
+        on_target_click=on_target_click,
+        log=log,
+      )
+      total_clicks += page_clicks
+      if work_ref is not None:
+        work_ref["page"] = page
 
-      requested_beyond_last = served_page_num < page_num
-      if requested_beyond_last:
-        serp_last_page = min(serp_last_page or served_page_num, served_page_num)
-        visible_serp_last_page = min(visible_serp_last_page or served_page_num, served_page_num)
-        self.logger(
-          f"[Search] Requested page {page_num} but Google kept page {served_page_num}; "
-          f"results end at page {serp_last_page} for '{keyword}'"
-        )
-        continue
-
-      if not mobile and not self._has_next_serp_page(page, profile, log=log):
+      if not self._has_next_serp_page(page, profile, log=log):
         detected_end = self._detect_serp_last_page(page, served_page_num, log=log)
         if detected_end and detected_end <= served_page_num:
           serp_last_page = min(serp_last_page or served_page_num, served_page_num)
-          visible_serp_last_page = min(visible_serp_last_page or served_page_num, served_page_num)
           self.logger(
             f"[Search] No further Google pages after page {serp_last_page} for '{keyword}'"
           )
-        elif not detected_end:
-          self.logger(
-            f"[Search] Next-page control not visible on page {served_page_num} "
-            f"for '{keyword}' (keeping SERP cap {serp_last_page})"
-          )
+          break
 
-    planned_pages = [
-      page_num
-      for page_num in search_order
-      if not self._desktop_page_should_skip(
-        page_num,
-        max_pages=max_pages,
-        visible_serp_cap=visible_serp_last_page,
-        history_page=history_page,
-      )
-    ]
+    planned_pages = [p for p in search_order if p <= (serp_last_page or max_pages)]
     self._last_search_exhaustion_eligible = (
       pages_with_results > 0
       and bool(planned_pages)
       and all(page_num in visited_result_pages for page_num in planned_pages)
     )
     self._last_search_exhausted = self._last_search_exhaustion_eligible
-
-    if serp_last_page and serp_last_page < max_pages:
+    if self._last_search_exhaustion_eligible and total_clicks == 0:
       self.logger(
-        f"[Search] Keyword '{keyword}' SERP depth capped at page {serp_last_page} "
-        f"(configured max {max_pages})"
+        f"[Search] All planned pages {planned_pages} checked for '{keyword}' "
+        "but no target domains were clicked."
       )
-    if self._last_search_exhaustion_eligible:
-      self.logger(
-        f"[Search] All planned pages {planned_pages} checked with results for '{keyword}' "
-        "but target was not found."
-      )
-    return None
+    return total_clicks
 
-  def _search_target_mobile(
+  def _scan_keyword_serp_mobile(
     self,
     page: Page,
     profile: ProfileSpec,
     keyword: str,
-    target: str,
     max_pages: int,
-    history_page: Optional[int],
     stop_event: Optional[threading.Event],
     stopped: Callable[[], bool],
     set_status: StatusCallback,
@@ -1981,46 +2646,35 @@ class SerpBot:
     log: Callable[[str], None],
     *,
     submit_search: bool,
-  ) -> Optional[Tuple[int, int, str]]:
-    """Mobile SERP: scan accumulated results, tap 더보기 once per virtual page (no URL jumps)."""
+    clicked_keys: set[str],
+    work_ref: Optional[dict],
+    network: Optional[NetworkOptimizer],
+    handle_response: Optional[Callable],
+    on_target_click: Optional[TargetClickCallback],
+  ) -> int:
     self._mobile_serp_end_reached = False
-    self._mobile_link_offset = 0
-    effective_cap = self._apply_serp_cap_floor(max_pages, history_page, max_pages)
-    planned_pages = list(range(1, effective_cap + 1))
-    start_page = self._serp_page_num(page, profile)
-    if not submit_search and start_page > 1:
-      planned_pages = [page_num for page_num in planned_pages if page_num >= start_page]
-      self.logger(
-        f"[Search] Mobile resume at virtual page {start_page} for '{keyword}' "
-        f"(scan order {planned_pages})"
-      )
-    else:
-      self.logger(
-        f"[Search] Mobile scan for '{keyword}': pages 1→{effective_cap} via 더보기 taps"
-      )
+    planned_pages = list(range(1, max_pages + 1))
+    total_clicks = 0
+    self.logger(
+      f"[Search] Mobile sequential scan for '{keyword}': pages 1→{max_pages} via 더보기 taps"
+    )
 
     pages_with_results = 0
     page = self._wait_for_serp_stable(page, log, timeout_seconds=10.0)
 
     for page_num in planned_pages:
       if stopped():
-        return None
+        return total_clicks
 
       page = self._wait_for_serp_stable(page, log, timeout_seconds=8.0)
       self._scroll_to_serp_pagination(page, mobile=True, fast=page_num > 1)
       self._serp_micro_scroll(page, profile, times=1)
 
       result_hrefs = self._collect_organic_result_hrefs_with_retry(
-        page,
-        page_num,
-        profile,
-        stop_event,
-        set_status,
-        on_ui_status,
-        log,
+        page, page_num, profile, stop_event, set_status, on_ui_status, log,
       )
       if result_hrefs is None:
-        return None
+        return total_clicks
 
       if not result_hrefs:
         for attempt in range(1, 5):
@@ -2038,67 +2692,62 @@ class SerpBot:
       if not result_hrefs:
         next_start = self._next_serp_start_offset(page, profile)
         more_available = self._mobile_serp_more_button_available(page, next_start)
-        if page_num == 1:
-          if not more_available:
-            self.logger(
-              f"[Search] Mobile: no organic results and no '검색결과 더보기' for '{keyword}' "
-              "— moving to next keyword"
-            )
-            self._mobile_serp_end_reached = True
-            self._last_search_exhaustion_eligible = True
-            break
-          self.logger(
-            f"[Search] Mobile page 1 still empty for '{keyword}' after retries "
-            "(continuing — may load after 더보기)"
-          )
-        else:
-          self.logger(
-            f"[Search] Mobile page {page_num}: no organic links for '{keyword}'; stopping scan"
-          )
+        if page_num == 1 and not more_available:
+          self._mobile_serp_end_reached = True
+          self._last_search_exhaustion_eligible = True
+          break
+        if page_num > 1:
           self._mobile_serp_end_reached = True
           break
+        continue
 
-      if result_hrefs:
-        pages_with_results += 1
-        self.logger(
-          f"[Search] Mobile page {page_num}: parsed {len(result_hrefs)} organic link(s) "
-          f"for '{keyword}'"
-        )
-        page_hrefs = result_hrefs[self._mobile_link_offset:]
-        for rank, href in enumerate(page_hrefs, start=1):
-          if self._href_matches_target(href, target):
-            return page_num, rank, href
-        self._mobile_link_offset = len(result_hrefs)
+      pages_with_results += 1
+      self.logger(
+        f"[Search] Mobile page {page_num}: parsed {len(result_hrefs)} organic link(s) "
+        f"for '{keyword}'"
+      )
+      page_clicks, page = self._process_page_target_matches(
+        page,
+        profile,
+        keyword,
+        page_num,
+        result_hrefs,
+        clicked_keys,
+        stop_event=stop_event,
+        stopped=stopped,
+        set_status=set_status,
+        on_ui_status=on_ui_status,
+        on_failure=on_failure,
+        work_ref=work_ref,
+        network=network,
+        handle_response=handle_response,
+        on_target_click=on_target_click,
+        log=log,
+      )
+      total_clicks += page_clicks
+      if work_ref is not None:
+        work_ref["page"] = page
 
-      if page_num >= effective_cap:
+      if page_num >= max_pages:
         break
 
       if not self._tap_mobile_more_once(page, profile, keyword, page_num):
         next_start = self._next_serp_start_offset(page, profile)
         more_available = self._mobile_serp_more_button_available(page, next_start)
-        if more_available:
-          self.logger(
-            f"[Search] Mobile: 더보기 present but tap failed after page {page_num} for '{keyword}'"
-          )
-        else:
-          self.logger(
-            f"[Search] Mobile: no '검색결과 더보기' after page {page_num} for '{keyword}' "
-            "— SERP ended, moving to next keyword"
-          )
-        self._mobile_serp_end_reached = True
+        if not more_available:
+          self._mobile_serp_end_reached = True
         break
 
     self._last_search_exhaustion_eligible = (
       pages_with_results > 0 and bool(planned_pages)
     ) or self._mobile_serp_end_reached
     self._last_search_exhausted = self._last_search_exhaustion_eligible
-    if self._last_search_exhaustion_eligible:
+    if self._last_search_exhaustion_eligible and total_clicks == 0:
       self.logger(
         f"[Search] Mobile scanned {pages_with_results} page(s) for '{keyword}' "
-        "but target was not found."
+        "but no target domains were clicked."
       )
-    return None
-
+    return total_clicks
   def _tap_mobile_more_once(
     self,
     page: Page,
@@ -2155,6 +2804,9 @@ class SerpBot:
         raise
       scroll_page(page, random.randint(350, 700), mobile=True)
       page.wait_for_timeout(random.randint(200, 450))
+    next_start = self._next_serp_start_offset(page, profile)
+    if self._goto_mobile_serp_start(page, profile, next_start, before_state):
+      return True
     return False
 
   def _navigate_to_search_page(
@@ -2516,9 +3168,11 @@ class SerpBot:
 
   def _next_serp_start_offset(self, page: Page, profile: ProfileSpec) -> int:
     url_start = self._current_serp_start_offset(page)
-    visible_start = self._visible_mobile_more_href_start(page)
-    if self._is_mobile_profile(profile) and url_start == 0 and visible_start is not None:
-      return visible_start
+    if self._is_mobile_profile(profile):
+      visible_start = self._visible_mobile_more_href_start(page)
+      if visible_start is not None and visible_start > url_start:
+        return visible_start
+      return url_start + 10
     tracked_start = max(0, self._mobile_serp_page - 1) * 10
     return max(url_start, tracked_start) + 10
 
@@ -2535,6 +3189,8 @@ class SerpBot:
             const rect = el.getBoundingClientRect();
             return rect.width > 6 && rect.height > 6;
           };
+          const normalizeQ = (value) => (value || '').replace(/\\s+/g, '').trim().toLowerCase();
+          const currentQ = normalizeQ(new URL(window.location.href).searchParams.get('q') || '');
           const parseStart = (href) => {
             if (!href) return null;
             try {
@@ -2548,16 +3204,34 @@ class SerpBot:
               return m ? parseInt(m[1], 10) : null;
             }
           };
+          const hrefMatchesCurrentQuery = (href) => {
+            if (!href) return true;
+            try {
+              const u = new URL(href, window.location.href);
+              const host = (u.hostname || '').toLowerCase();
+              if (host && !host.includes('google.')) return false;
+              const linkQ = normalizeQ(u.searchParams.get('q') || '');
+              if (currentQ && linkQ && linkQ !== currentQ) return false;
+              if (u.pathname.includes('/privacy') || u.pathname.includes('/policies')) return false;
+              return true;
+            } catch (e) {
+              return false;
+            }
+          };
           let best = null;
           let bestBottom = -1;
           const selectors = ['a[jsname="oHxHid"]', 'a[aria-label="검색결과 더보기"]'];
           for (const selector of selectors) {
             document.querySelectorAll(selector).forEach((el) => {
               if (!isTapVisible(el)) return;
+              const href = el.getAttribute('href') || '';
+              if (!hrefMatchesCurrentQuery(href)) return;
+              const hrefStart = parseStart(href);
+              if (hrefStart === null || hrefStart <= 0) return;
               const rect = el.getBoundingClientRect();
               if (rect.bottom <= bestBottom) return;
               bestBottom = rect.bottom;
-              best = parseStart(el.getAttribute('href') || '');
+              best = hrefStart;
             });
           }
           return best;
@@ -2687,6 +3361,44 @@ class SerpBot:
     except Exception:
       pass
     return None
+
+  def _goto_mobile_serp_start(
+    self,
+    page: Page,
+    profile: ProfileSpec,
+    next_start: int,
+    before_state: Optional[dict] = None,
+  ) -> bool:
+    if before_state is None:
+      before_state = self._snapshot_mobile_pagination_state(page)
+    keyword = ""
+    try:
+      qs = parse_qs(urlparse(page.url).query)
+      keyword = unquote(qs.get("q", [""])[0] or "")
+    except Exception:
+      pass
+    if not keyword.strip():
+      return False
+    search_url = self._google_search_url(keyword, profile, start=max(0, int(next_start)))
+    self.logger(
+      f"[Search] Mobile: opening page via start={next_start} URL for '{keyword}'"
+    )
+    try:
+      page.goto(search_url, wait_until="domcontentloaded", timeout=35000)
+      page.wait_for_timeout(random.randint(450, 950))
+    except Exception as exc:
+      self.logger(f"[Search] Mobile start URL navigation failed: {exc}")
+      return False
+    after_state = self._snapshot_mobile_pagination_state(page)
+    if self._pagination_advanced(before_state, after_state, next_start):
+      url_page = self._current_search_results_page_num(page)
+      if url_page > 0:
+        self._mobile_serp_page = url_page
+      return True
+    if after_state.get("start", 0) >= next_start and after_state.get("start", 0) > before_state.get("start", 0):
+      self._mobile_serp_page = max(self._mobile_serp_page, (next_start // 10) + 1)
+      return True
+    return False
 
   def _click_mobile_pagination_locator(
     self,
@@ -2926,7 +3638,7 @@ class SerpBot:
     """Tap known Google mobile control: a[jsname=oHxHid] / aria-label=검색결과 더보기."""
     try:
       clicked = page.evaluate(
-        """() => {
+        """(nextStart) => {
           const isTapVisible = (el) => {
             if (!el) return false;
             if (el.getAttribute('aria-hidden') === 'true') return false;
@@ -2934,6 +3646,37 @@ class SerpBot:
             if (style.display === 'none' || style.visibility === 'hidden') return false;
             const rect = el.getBoundingClientRect();
             return rect.width > 6 && rect.height > 6;
+          };
+          const normalizeQ = (value) => (value || '').replace(/\\s+/g, '').trim().toLowerCase();
+          const currentQ = normalizeQ(new URL(window.location.href).searchParams.get('q') || '');
+          const parseStart = (href) => {
+            if (!href) return null;
+            try {
+              const u = new URL(href, window.location.href);
+              const raw = u.searchParams.get('start');
+              if (raw === null || raw === '') return 0;
+              const n = parseInt(raw, 10);
+              return Number.isFinite(n) ? n : null;
+            } catch (e) {
+              const m = href.match(/[?&]start=(\\d+)/i);
+              return m ? parseInt(m[1], 10) : null;
+            }
+          };
+          const hrefMatches = (href) => {
+            if (!href) return false;
+            try {
+              const u = new URL(href, window.location.href);
+              const host = (u.hostname || '').toLowerCase();
+              if (host && !host.includes('google.')) return false;
+              const linkQ = normalizeQ(u.searchParams.get('q') || '');
+              if (currentQ && linkQ && linkQ !== currentQ) return false;
+              if (u.pathname.includes('/privacy') || u.pathname.includes('/policies')) return false;
+              const hrefStart = parseStart(href);
+              if (nextStart > 0 && hrefStart !== nextStart) return false;
+              return true;
+            } catch (e) {
+              return false;
+            }
           };
           const selectors = [
             'a[jsname="oHxHid"]',
@@ -2944,6 +3687,8 @@ class SerpBot:
           for (const selector of selectors) {
             document.querySelectorAll(selector).forEach((el) => {
               if (!isTapVisible(el)) return;
+              const href = el.getAttribute('href') || '';
+              if (!hrefMatches(href)) return;
               const rect = el.getBoundingClientRect();
               if (rect.bottom <= bestBottom) return;
               bestBottom = rect.bottom;
@@ -2951,16 +3696,13 @@ class SerpBot:
             });
           }
           if (!best) return '';
-          const href = best.getAttribute('href') || '';
-          if (href && !href.includes('/search') && !href.startsWith('?') && !href.startsWith('#')) {
-            return '';
-          }
           best.scrollIntoView({ block: 'center', behavior: 'instant' });
           best.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
           best.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
           best.click();
           return best.getAttribute('jsname') || best.getAttribute('aria-label') || 'visible-more';
-        }"""
+        }""",
+        next_start,
       )
       if not clicked:
         return False
@@ -3194,6 +3936,21 @@ class SerpBot:
         return True
       if not self._is_google_serp_url(after_state.get("url") or ""):
         self._recover_google_serp_after_mistap(page, before_state.get("url") or "")
+      if href and self._is_mobile_more_button_href(href):
+        try:
+          full_href = urljoin(page.url, href)
+          self.logger(
+            f"[Search] Mobile: tap failed — opening pagination href directly "
+            f"({full_href[:100]})"
+          )
+          page.goto(full_href, wait_until="domcontentloaded", timeout=20000)
+          page.wait_for_timeout(random.randint(450, 950))
+          after_state = self._snapshot_mobile_pagination_state(page)
+          if self._pagination_advanced(before_state, after_state, next_start):
+            self.logger("[Search] Mobile: pagination href navigation verified")
+            return True
+        except Exception as href_exc:
+          self.logger(f"[Search] Mobile: pagination href goto failed — {href_exc}")
       self.logger(
         f"[Search] Mobile: tap via {method} did not advance pagination "
         f"(links {before_state.get('organic_count')}→{after_state.get('organic_count')})"
@@ -3214,6 +3971,7 @@ class SerpBot:
           const blockedText = /비지니스|business|지도|maps|리뷰|review|장소|place|전화|영업/i;
           const primaryLabels = ['검색결과 더보기', '검색결과 더 보기', 'more search results'];
           const normalize = (value) => (value || '').replace(/\\s+/g, '').trim().toLowerCase();
+          const currentQ = normalize(new URL(window.location.href).searchParams.get('q') || '');
           const matchesPrimary = (text) => {
             const norm = normalize(text);
             if (!norm || blockedText.test(text || '')) return false;
@@ -3230,6 +3988,20 @@ class SerpBot:
             } catch (e) {
               const m = href.match(/[?&]start=(\\d+)/i);
               return m ? parseInt(m[1], 10) : null;
+            }
+          };
+          const hrefMatchesCurrentQuery = (href) => {
+            if (!href) return true;
+            try {
+              const u = new URL(href, window.location.href);
+              const host = (u.hostname || '').toLowerCase();
+              if (host && !host.includes('google.')) return false;
+              const linkQ = normalize(u.searchParams.get('q') || '');
+              if (currentQ && linkQ && linkQ !== currentQ) return false;
+              if (u.pathname.includes('/privacy') || u.pathname.includes('/policies')) return false;
+              return true;
+            } catch (e) {
+              return false;
             }
           };
           const isVisible = (el) => {
@@ -3285,7 +4057,9 @@ class SerpBot:
               if (!el || el.getAttribute('aria-hidden') === 'true') return;
               if (!isVisible(el)) return;
               const href = el.getAttribute('href') || '';
-              if (href && parseStart(href) !== null && parseStart(href) !== nextStart) return;
+              if (!hrefMatchesCurrentQuery(href)) return;
+              const hrefStart = parseStart(href);
+              if (nextStart > 0 && hrefStart !== nextStart) return;
               push(el, 3200, selector, href);
             });
           }
@@ -3301,7 +4075,9 @@ class SerpBot:
             if (!clickable || !isVisible(clickable)) continue;
             const rect = clickable.getBoundingClientRect();
             const href = clickable.getAttribute('href') || '';
+            if (!hrefMatchesCurrentQuery(href)) continue;
             const hrefStart = parseStart(href);
+            if (nextStart > 0 && hrefStart !== nextStart) continue;
             let score = rect.bottom;
             if (hrefStart === nextStart) score += 2000;
             else if (hrefStart !== null && hrefStart > 0) score += 500;
@@ -3460,6 +4236,9 @@ class SerpBot:
       if self._pagination_advanced(before_state, self._snapshot_mobile_pagination_state(page), next_start):
         return True
 
+    if self._goto_mobile_serp_start(page, profile, next_start, before_state):
+      return True
+
     target = self._find_mobile_serp_pagination_target(page, next_start)
     if target:
       self.logger(
@@ -3555,9 +4334,12 @@ class SerpBot:
       return False
     normalized = SerpBot._normalize_domain(href)
     target_norm = SerpBot._normalize_domain(target)
-    if not normalized or not target_norm:
+    if not target_norm:
       return False
-    return normalized == target_norm or normalized.endswith(f".{target_norm}")
+    if normalized and (normalized == target_norm or normalized.endswith(f".{target_norm}")):
+      return True
+    lowered = (href or "").lower()
+    return target_norm in lowered
 
   @staticmethod
   def _collect_organic_result_hrefs_js(page: Page) -> list[str]:
@@ -4118,7 +4900,7 @@ class SerpBot:
     if stopped():
       return False
     mobile = self._is_mobile_profile(profile) if profile else False
-    domain = self._normalize_domain(self.config.target_domain)
+    domain = self._normalize_domain(self.config.primary_target_domain)
     selector = (
       f'a[href*="{domain}"], a[href^="/"], a[href^="./"], a[href^="../"]'
       if mobile
@@ -4239,12 +5021,15 @@ class SerpBot:
           return
       if stopped():
         return
-      scroll_page(
-        page,
-        random.choice((-1, 1)) * random.randint(120, 420),
-        mobile=mobile,
-      )
-      random_delay(self.config.action_delay_min, self.config.action_delay_max)
+      try:
+        scroll_page(
+          page,
+          random.choice((-1, 1)) * random.randint(120, 420),
+          mobile=mobile,
+        )
+        random_delay(self.config.action_delay_min, self.config.action_delay_max)
+      except Exception:
+        return
       elapsed += sleep_for
 
   @staticmethod

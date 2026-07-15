@@ -23,6 +23,11 @@ from utils.keyword_rotation import KeywordRotationStore
 
 
 class BotWorkerThread(QThread):
+  _DELETE_API_SEMAPHORE = threading.Semaphore(2)
+  _POST_TERMINATE_DELETE_DELAY_SECONDS = 4.0
+  _ORPHAN_DELETE_DELAY_SECONDS = 180.0
+  _FORCE_STOP_MIN_PROFILE_AGE_SECONDS = 45.0
+
   log = pyqtSignal(str)
   profile_update = pyqtSignal(str, str, str)
   traffic_update = pyqtSignal(str, str, int)
@@ -53,31 +58,124 @@ class BotWorkerThread(QThread):
     self._failure_callback = failure_callback
     self._stop_requested = False
     self._profile_stop_events: Dict[str, threading.Event] = {}
+    self._profile_phases: Dict[str, str] = {}
+    self._graceful_stop_pending: set[str] = set()
+    self._phase_lock = threading.Lock()
     self._created_profile_ids: set[str] = set()
-    self._force_cleanup_started = False
+    self._profile_created_at: Dict[str, float] = {}
+    self._shutdown_waiter_started = False
     self._deleted_profile_ids: set[str] = set()
     self._delete_lock = threading.Lock()
     self._lifecycle_lock = threading.Lock()
+    self._orphan_delete_queue: Dict[str, str] = {}
+    self._orphan_queue_lock = threading.Lock()
+    self._orphan_sweeper_started = False
 
-  def request_stop(self) -> None:
-    self._stop_requested = True
-    for event in list(self._profile_stop_events.values()):
-      event.set()
-    if not self._force_cleanup_started:
-      self._force_cleanup_started = True
-      threading.Thread(target=self._force_stop_and_delete_profiles_now, daemon=True).start()
+  def _on_profile_phase(self, profile_id: str, status_key: str) -> None:
+    with self._phase_lock:
+      self._profile_phases[profile_id] = status_key
+      pending = profile_id in self._graceful_stop_pending
+    if pending and status_key != UiStatusKey.VISITING_SITE.value:
+      event = self._profile_stop_events.get(profile_id)
+      if event and not event.is_set():
+        event.set()
+        with self._phase_lock:
+          self._graceful_stop_pending.discard(profile_id)
+        self._emit_log(
+          f"[Worker] Profile {profile_id} finished dwell — stopping now."
+        )
 
-  def request_profile_pause(self, profile_id: str) -> bool:
-    """Gracefully stop one running profile without stopping the automation loop."""
+  def _request_profile_stop(self, profile_id: str, *, global_stop: bool = False) -> bool:
     event = self._profile_stop_events.get(profile_id)
     if not event:
       return False
-    event.set()
-    self._emit_log(f"[Worker] Graceful stop requested for profile {profile_id} only")
+    with self._phase_lock:
+      phase = self._profile_phases.get(profile_id, "")
+    if phase == UiStatusKey.VISITING_SITE.value:
+      with self._phase_lock:
+        self._graceful_stop_pending.add(profile_id)
+      self._emit_log(
+        f"[Worker] Stop deferred for {profile_id} — finishing target dwell first."
+      )
+    else:
+      event.set()
+      if not global_stop:
+        self._emit_log(f"[Worker] Stop requested for profile {profile_id}")
+    self._ensure_shutdown_waiter()
     return True
+
+  def _ensure_shutdown_waiter(self) -> None:
+    if self._shutdown_waiter_started:
+      return
+    self._shutdown_waiter_started = True
+    threading.Thread(target=self._wait_for_graceful_shutdown, daemon=True).start()
+
+  def _graceful_shutdown_timeout_seconds(self) -> float:
+    dwell_max = float(getattr(self.config, "dwell_max", 180) or 180)
+    return max(120.0, dwell_max + 45.0)
+
+  def _wait_for_graceful_shutdown(self) -> None:
+    deadline = time.time() + self._graceful_shutdown_timeout_seconds()
+    while time.time() < deadline:
+      with self._phase_lock:
+        active_ids = list(self._profile_stop_events.keys())
+        pending = list(self._graceful_stop_pending)
+      if not active_ids:
+        self._emit_log("[Worker] Graceful stop complete — all profiles finished.")
+        return
+      for profile_id in pending:
+        with self._phase_lock:
+          phase = self._profile_phases.get(profile_id, "")
+        if phase != UiStatusKey.VISITING_SITE.value:
+          event = self._profile_stop_events.get(profile_id)
+          if event and not event.is_set():
+            event.set()
+            with self._phase_lock:
+              self._graceful_stop_pending.discard(profile_id)
+            self._emit_log(
+              f"[Worker] Profile {profile_id} left dwell — stopping now."
+            )
+      with self._phase_lock:
+        active_ids = list(self._profile_stop_events.keys())
+      if not active_ids:
+        self._emit_log("[Worker] Graceful stop complete — all profiles finished.")
+        return
+      time.sleep(1.0)
+    self._emit_log(
+      "[Worker] Graceful stop timeout — force-terminating remaining profiles."
+    )
+    self._force_stop_and_delete_profiles_now()
+
+  def request_stop(self) -> None:
+    self._stop_requested = True
+    self._emit_log(
+      "[Worker] Graceful stop requested — SERP/warmup profiles stop now; "
+      "target dwell completes first."
+    )
+    for profile_id in list(self._profile_stop_events.keys()):
+      self._request_profile_stop(profile_id, global_stop=True)
+
+  def request_profile_pause(self, profile_id: str) -> bool:
+    """Gracefully stop one running profile without stopping the automation loop."""
+    return self._request_profile_stop(profile_id, global_stop=False)
 
   def is_profile_running(self, profile_id: str) -> bool:
     return profile_id in self._profile_stop_events
+
+  def _should_skip_force_delete(self, profile_id: str) -> bool:
+    created_at = self._profile_created_at.get(profile_id, 0.0)
+    if created_at <= 0:
+      return False
+    age = time.time() - created_at
+    if age >= self._FORCE_STOP_MIN_PROFILE_AGE_SECONDS:
+      return False
+    if profile_id in self._profile_stop_events:
+      self._emit_log(
+        f"[Worker] Skipping force-delete for young profile {profile_id} "
+        f"({age:.0f}s old, still active)"
+      )
+      return True
+    return False
 
   def _force_stop_and_delete_profiles_now(self) -> None:
     active_profile_ids = list(dict.fromkeys(list(self._profile_stop_events.keys())))
@@ -114,9 +212,14 @@ class BotWorkerThread(QThread):
     for profile_id in created_profile_ids:
       if profile_id in self._deleted_profile_ids:
         continue
+      if self._should_skip_force_delete(profile_id):
+        continue
       self._delete_profile_with_retry(manager, profile_id, reason="force-stop", skip_terminate=True)
 
-    remaining = [pid for pid in self._created_profile_ids if pid not in self._deleted_profile_ids]
+    remaining = [
+      pid for pid in self._created_profile_ids
+      if pid not in self._deleted_profile_ids and not self._should_skip_force_delete(pid)
+    ]
     if remaining:
       self._emit_log(f"[Worker] Retrying delete for {len(remaining)} profile(s) still present after force-stop.")
       time.sleep(2.0)
@@ -130,7 +233,62 @@ class BotWorkerThread(QThread):
         return
       self._deleted_profile_ids.add(profile_id)
     self._created_profile_ids.discard(profile_id)
+    self._profile_created_at.pop(profile_id, None)
     self.profile_deleted.emit(profile_id)
+
+  def _schedule_orphan_delete(self, profile_id: str, reason: str) -> None:
+    if not profile_id:
+      return
+    with self._orphan_queue_lock:
+      if profile_id in self._deleted_profile_ids:
+        return
+      if profile_id not in self._orphan_delete_queue:
+        self._orphan_delete_queue[profile_id] = reason
+        self._emit_log(
+          f"[Worker] Queued orphan delete for {profile_id} "
+          f"(retry in {int(self._ORPHAN_DELETE_DELAY_SECONDS)}s, reason={reason})"
+        )
+      if not self._orphan_sweeper_started:
+        self._orphan_sweeper_started = True
+        threading.Thread(target=self._orphan_delete_sweeper_loop, daemon=True).start()
+
+  def _orphan_delete_sweeper_loop(self) -> None:
+    while not self._stop_requested:
+      self._interruptible_sleep(30.0)
+      with self._orphan_queue_lock:
+        pending = {
+          profile_id: reason
+          for profile_id, reason in list(self._orphan_delete_queue.items())
+          if profile_id not in self._deleted_profile_ids
+        }
+      if not pending:
+        with self._orphan_queue_lock:
+          if not self._orphan_delete_queue:
+            self._orphan_sweeper_started = False
+        return
+
+      manager = AdsPowerManager(
+        self.config.adspower_url,
+        self.config.adspower_api_key,
+        self._emit_log,
+      )
+      for profile_id, reason in list(pending.items()):
+        if profile_id in self._deleted_profile_ids:
+          with self._orphan_queue_lock:
+            self._orphan_delete_queue.pop(profile_id, None)
+          continue
+        self._emit_log(f"[Worker] Orphan delete sweep for {profile_id} ({reason})")
+        if self._delete_profile_with_retry(
+          manager,
+          profile_id,
+          reason=f"orphan-sweep:{reason}",
+          skip_terminate=True,
+        ):
+          with self._orphan_queue_lock:
+            self._orphan_delete_queue.pop(profile_id, None)
+          self.profiles_changed.emit()
+        else:
+          self._interruptible_sleep(self._ORPHAN_DELETE_DELAY_SECONDS)
 
   def _delete_profile_with_retry(
     self,
@@ -152,16 +310,24 @@ class BotWorkerThread(QThread):
           manager.force_terminate_profile(profile_id)
       except Exception as exc:
         self._emit_log(f"[Worker] Force terminate warning for {profile_id}: {exc}")
+      self._emit_log(
+        f"[Worker] Waiting {self._POST_TERMINATE_DELETE_DELAY_SECONDS:.0f}s "
+        f"for AdsPower to release {profile_id} before delete"
+      )
+      self._interruptible_sleep(self._POST_TERMINATE_DELETE_DELAY_SECONDS)
 
     for attempt in range(1, 8):
       with self._delete_lock:
         if profile_id in self._deleted_profile_ids:
           return True
       try:
-        with self._lifecycle_lock:
-          manager.delete_profiles([profile_id])
+        with self._DELETE_API_SEMAPHORE:
+          with self._lifecycle_lock:
+            manager.delete_profiles([profile_id])
         self._emit_log(f"[Worker] Deleted profile {profile_id} ({reason})")
         self._emit_profile_deleted_once(profile_id)
+        with self._orphan_queue_lock:
+          self._orphan_delete_queue.pop(profile_id, None)
         return True
       except Exception as exc:
         self._emit_log(f"[Worker] Delete retry {attempt}/7 failed for {profile_id}: {exc}")
@@ -171,13 +337,16 @@ class BotWorkerThread(QThread):
           if not exists:
             self._emit_log(f"[Worker] Profile {profile_id} already absent after delete attempt ({reason})")
             self._emit_profile_deleted_once(profile_id)
+            with self._orphan_queue_lock:
+              self._orphan_delete_queue.pop(profile_id, None)
             return True
         except Exception as verify_exc:
           self._emit_log(f"[Worker] Verify delete failed for {profile_id}: {verify_exc}")
-        backoff = 1.5 * attempt
+        backoff = min(30.0, 3.0 * (2 ** (attempt - 1)))
         if AdsPowerManager._is_rate_limit_error(str(exc)):
-          backoff = max(backoff, 3.0 * attempt)
+          backoff = max(backoff, min(45.0, 5.0 * attempt))
         self._interruptible_sleep(backoff)
+    self._schedule_orphan_delete(profile_id, reason)
     return False
 
   def _emit_log(self, message: str) -> None:
@@ -304,11 +473,13 @@ class BotWorkerThread(QThread):
       assigned_keywords = self._assigned_keywords_for_profile(profile, max_keywords=remaining_keywords)
       if not assigned_keywords:
         self._emit_log(
-          f"[Worker] No keywords assigned for {profile.name}; deleting profile and stopping auto loop."
+          f"[Worker] No keywords assigned for {profile.name} "
+          f"({profile.device_label}); deleting profile and trying next slot."
         )
         if self._delete_profile_with_retry(adspower, profile.profile_id, reason="no-keywords-assigned"):
           self.profiles_changed.emit()
-        break
+        self._interruptible_sleep(1.0)
+        continue
       dispatched_keywords += len(assigned_keywords)
       completed_cycles = dispatched_keywords // keywords_per_cycle
       self.cycle_progress.emit(min(completed_cycles, cycles_target), cycles_target)
@@ -385,6 +556,7 @@ class BotWorkerThread(QThread):
       )
       profile = created[0]
       self._created_profile_ids.add(profile.profile_id)
+      self._profile_created_at[profile.profile_id] = time.time()
       self._emit_profile_update(profile, ProfileStatus.CREATING_PROFILE)
       self._emit_log(f"[Worker] Created profile for auto run {run_number}: {profile.name} ({profile.profile_id})")
       return profile
@@ -447,6 +619,7 @@ class BotWorkerThread(QThread):
         serp_bot = SerpBot(self.config, self._emit_log)
 
         def on_ui_status(status_key: str, display_text: str) -> None:
+          self._on_profile_phase(profile.profile_id, status_key)
           self._emit_ui_status(profile, status_key, display_text)
 
         def on_failure(failed_profile: ProfileSpec, context: str, exc: BaseException) -> None:
@@ -509,10 +682,16 @@ class BotWorkerThread(QThread):
         self._emit_log(f"[Worker] Deleted profile {profile.name} after run ({outcome}); proxy entry kept.")
         self.profiles_changed.emit()
       else:
-        self._emit_log(f"[Worker] Failed to delete profile {profile.name} after run ({outcome})")
+        self._emit_log(
+          f"[Worker] Failed to delete profile {profile.name} after run ({outcome}); "
+          "orphan sweep scheduled"
+        )
     if scheduler:
       scheduler.mark_finished(proxy_key)
     self._profile_stop_events.pop(profile.profile_id, None)
+    with self._phase_lock:
+      self._profile_phases.pop(profile.profile_id, None)
+      self._graceful_stop_pending.discard(profile.profile_id)
 
     if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
       self._emit_profile_update(
@@ -558,8 +737,10 @@ class BotWorkerThread(QThread):
       max_per_profile = min(max_per_profile, max(0, int(max_keywords)))
     if max_per_profile <= 0:
       return []
+
     assigned = self.keyword_rotation.allocate(
-      target_domain=self.config.target_domain,
+      target_domain=self.config.primary_target_domain,
+      target_domains=self.config.get_target_domains(),
       keywords=keywords,
       batch_size=max_per_profile,
     )
@@ -674,6 +855,14 @@ class ProfileController(QObject):
     if self._global_worker and self._global_worker.isRunning():
       self._global_worker.request_stop()
       self.log.emit("[Controller] Global bot stop requested")
+
+  def reset_session_traffic(self) -> None:
+    self._session_traffic_total = 0
+    self._profile_traffic_totals.clear()
+    self._proxy_traffic_totals.clear()
+
+  def get_session_traffic_total(self) -> int:
+    return int(self._session_traffic_total)
 
   def start_profile_manual(self, profile_id: str, config: BotConfig) -> bool:
     profile = self._profiles.get(profile_id)

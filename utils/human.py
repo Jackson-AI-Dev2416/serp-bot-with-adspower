@@ -124,6 +124,139 @@ def human_touch_click(
     random_delay(delay_lo, delay_hi)
 
 
+def _clear_serp_search_input(locator: Locator, page: Page, *, mobile: bool) -> None:
+    """Clear Google SERP search box; Android needs JS/value reset (Ctrl+A does not work)."""
+    page.wait_for_timeout(random.randint(120, 280))
+    if mobile:
+        try:
+            locator.evaluate(
+                """el => {
+                    if (!el) return;
+                    el.focus();
+                    if (typeof el.select === 'function') {
+                        el.select();
+                    }
+                    el.value = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }"""
+            )
+            page.wait_for_timeout(random.randint(80, 180))
+        except Exception:
+            pass
+        try:
+            locator.fill("")
+        except Exception:
+            pass
+        try:
+            remaining = (locator.input_value(timeout=2000) or "").strip()
+            if remaining:
+                locator.evaluate(
+                    """el => {
+                        if (!el) return;
+                        el.focus();
+                        if (typeof el.select === 'function') {
+                            el.select();
+                        }
+                        el.value = '';
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                    }"""
+                )
+                page.wait_for_timeout(random.randint(80, 160))
+                try:
+                    locator.fill("")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return
+
+    try:
+        locator.focus()
+    except Exception:
+        pass
+    try:
+        locator.fill("")
+    except Exception:
+        try:
+            locator.press("Control+a")
+            locator.press("Backspace")
+        except Exception:
+            pass
+
+
+def human_type_focus_safe(
+    locator: Locator,
+    text: str,
+    lo: float,
+    hi: float,
+    *,
+    page: Page,
+    mobile: bool = False,
+    typo_chance: float = 0.03,
+    min_length_for_typo: int = 9,
+) -> None:
+    """Type into SERP search box without requiring OS window focus (desktop: locator API)."""
+    type_lo = max(0.06, float(lo))
+    type_hi = max(type_lo + 0.04, float(hi))
+    if mobile:
+        try:
+            human_touch_click(page, locator, type_lo, type_hi)
+        except Exception:
+            try:
+                locator.focus()
+            except Exception:
+                pass
+        _clear_serp_search_input(locator, page, mobile=True)
+        human_type(
+            locator,
+            text,
+            type_lo,
+            type_hi,
+            typo_chance=typo_chance,
+            min_length_for_typo=min_length_for_typo,
+            page=page,
+            mobile=True,
+            skip_clear=True,
+        )
+        return
+
+    type_lo = max(0.06, float(lo))
+    type_hi = max(type_lo + 0.04, float(hi))
+    try:
+        locator.focus()
+    except Exception:
+        pass
+    page.wait_for_timeout(random.randint(120, 280))
+    try:
+        locator.fill("")
+    except Exception:
+        try:
+            locator.press("Control+a")
+            locator.press("Backspace")
+        except Exception:
+            pass
+    made_typo = False
+    for ch in text:
+        can_typo = (
+            not made_typo
+            and len(text) >= min_length_for_typo
+            and ch.isalpha()
+            and random.random() < typo_chance
+        )
+        if can_typo:
+            wrong = _neighbor_typo(ch)
+            if wrong != ch:
+                delay_wrong = random.uniform(type_lo, type_hi) * 1000
+                locator.type(wrong, delay=delay_wrong)
+                random_delay(max(0.05, type_lo * 0.6), max(0.12, type_hi * 0.8))
+                locator.press("Backspace")
+                random_delay(max(0.05, type_lo * 0.6), max(0.15, type_hi))
+                made_typo = True
+        delay_ch = random.uniform(type_lo, type_hi) * 1000
+        locator.type(ch, delay=delay_ch)
+
+
 def human_type(
     locator: Locator,
     text: str,
@@ -134,6 +267,7 @@ def human_type(
     *,
     page: Optional[Page] = None,
     mobile: bool = False,
+    skip_clear: bool = False,
 ) -> None:
     type_lo = max(0.06, float(lo))
     type_hi = max(type_lo + 0.04, float(hi))
@@ -147,13 +281,17 @@ def human_type(
             locator.focus()
         except Exception:
             pass
-    page.wait_for_timeout(random.randint(120, 280)) if page else time.sleep(random.uniform(0.12, 0.28))
-    try:
-        locator.fill("")
-    except Exception:
-        if page:
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
+    if not skip_clear:
+        if mobile and page:
+            _clear_serp_search_input(locator, page, mobile=True)
+        else:
+            page.wait_for_timeout(random.randint(120, 280)) if page else time.sleep(random.uniform(0.12, 0.28))
+            try:
+                locator.fill("")
+            except Exception:
+                if page:
+                    page.keyboard.press("Control+A")
+                    page.keyboard.press("Backspace")
     made_typo = False
     keyboard = page.keyboard if page else None
     for ch in text:
@@ -185,6 +323,42 @@ def human_type(
             locator.type(ch, delay=delay_ch)
 
 
+def human_keyboard_type(
+    page: Page,
+    text: str,
+    lo: float,
+    hi: float,
+    typo_chance: float = 0.03,
+    min_length_for_typo: int = 9,
+) -> None:
+    """Type into the focused field (e.g. browser omnibox) via page.keyboard."""
+    type_lo = max(0.06, float(lo))
+    type_hi = max(type_lo + 0.04, float(hi))
+    keyboard = page.keyboard
+    page.wait_for_timeout(random.randint(120, 280))
+    keyboard.press("Control+a")
+    keyboard.press("Backspace")
+    made_typo = False
+    for ch in text:
+        can_typo = (
+            not made_typo
+            and len(text) >= min_length_for_typo
+            and ch.isalpha()
+            and random.random() < typo_chance
+        )
+        if can_typo:
+            wrong = _neighbor_typo(ch)
+            if wrong != ch:
+                delay_wrong = random.uniform(type_lo, type_hi) * 1000
+                keyboard.type(wrong, delay=delay_wrong)
+                random_delay(max(0.05, type_lo * 0.6), max(0.12, type_hi * 0.8))
+                keyboard.press("Backspace")
+                random_delay(max(0.05, type_lo * 0.6), max(0.15, type_hi))
+                made_typo = True
+        delay_ch = random.uniform(type_lo, type_hi) * 1000
+        keyboard.type(ch, delay=delay_ch)
+
+
 def micro_scroll(
     page: Page,
     times: int = 1,
@@ -199,19 +373,24 @@ def micro_scroll(
 
 
 def scroll_page(page: Page, delta_y: int, *, mobile: bool = False) -> None:
-    if mobile:
-        # Flick-style scroll: short burst with slight horizontal jitter (like a thumb).
-        flick = int(delta_y)
-        jitter_x = random.randint(-6, 6)
-        page.evaluate(
-            """([y, jx]) => {
-              window.scrollBy({ top: Number(y) || 0, left: Number(jx) || 0, behavior: 'auto' });
-            }""",
-            [flick, jitter_x],
-        )
-        page.wait_for_timeout(random.randint(70, 200))
-    else:
-        page.mouse.wheel(0, int(delta_y))
+    try:
+        if page.is_closed():
+            return
+        if mobile:
+            # Flick-style scroll: short burst with slight horizontal jitter (like a thumb).
+            flick = int(delta_y)
+            jitter_x = random.randint(-6, 6)
+            page.evaluate(
+                """([y, jx]) => {
+                  window.scrollBy({ top: Number(y) || 0, left: Number(jx) || 0, behavior: 'auto' });
+                }""",
+                [flick, jitter_x],
+            )
+            page.wait_for_timeout(random.randint(70, 200))
+        else:
+            page.mouse.wheel(0, int(delta_y))
+    except Exception:
+        pass
 
 
 def human_click(
@@ -221,6 +400,7 @@ def human_click(
     *,
     page: Optional[Page] = None,
     mobile: bool = False,
+    modifiers: Optional[list[str]] = None,
 ) -> None:
     if mobile and page:
         try:
@@ -230,9 +410,10 @@ def human_click(
             pass
 
     random_delay(delay_lo, delay_hi)
+    click_mods = list(modifiers or [])
     try:
         locator.scroll_into_view_if_needed(timeout=3000)
-        locator.click(timeout=5000)
+        locator.click(timeout=5000, modifiers=click_mods)
     except Exception:
-        locator.click(timeout=2500, force=True)
+        locator.click(timeout=2500, force=True, modifiers=click_mods)
     random_delay(delay_lo, delay_hi)

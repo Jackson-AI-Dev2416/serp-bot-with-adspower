@@ -1,5 +1,6 @@
 from html import escape
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -19,8 +20,10 @@ from PyQt6.QtWidgets import (
   QListWidget,
   QListWidgetItem,
   QMainWindow,
+  QMessageBox,
   QPlainTextEdit,
   QPushButton,
+  QButtonGroup,
   QSpinBox,
   QTabWidget,
   QTableWidget,
@@ -46,11 +49,15 @@ from utils.cursor_models import CURSOR_MODEL_CHOICES, DEFAULT_CURSOR_MODEL, norm
 from utils.csv_logger import (
   SessionClickCsvLogger,
   aggregate_keyword_clicks,
+  aggregate_keyword_clicks_for_domain,
   count_target_not_found_in_session,
+  filter_click_rows_by_domain,
   format_result_session_label,
   list_session_result_files,
   new_session_click_log_path,
+  read_session_click_file,
   session_result_window,
+  session_target_domains,
 )
 from utils.self_healer import SelfHealer
 
@@ -315,6 +322,22 @@ QPushButton#btnKeywordClicks:checked {
   background-color: #4f46e5;
   border-color: #818cf8;
   color: #ffffff;
+}
+QPushButton#btnDeleteResult {
+  background-color: #7f1d1d;
+  color: #fecaca;
+  border: 1px solid #b91c1c;
+  padding: 7px 14px;
+}
+QPushButton#btnDeleteResult:hover {
+  background-color: #991b1b;
+  border-color: #f87171;
+  color: #ffffff;
+}
+QPushButton#btnDeleteResult:disabled {
+  background-color: #1e2430;
+  color: #64748b;
+  border-color: #334155;
 }
 QPushButton#btnStartAuto {
   background-color: #059669;
@@ -929,8 +952,10 @@ class UiMainWindow(QMainWindow):
 
     target_group = QGroupBox("Targeting & Automation")
     target_form = QFormLayout(target_group)
-    self.target_domain = QLineEdit()
-    self.target_domain.setPlaceholderText("mysite.com")
+    self.target_domains_edit = QPlainTextEdit()
+    self.target_domains_edit.setPlaceholderText("mysite.com\nothersite.com")
+    self.target_domains_edit.setMaximumHeight(72)
+    self.target_domains_edit.setToolTip("One target domain per line (max 5). All are searched on each SERP page.")
     launch_row = self._min_max_row(QSpinBox, 1, 3600, 1, 4)
     dwell_row = self._min_max_row(QSpinBox, 10, 3600, 60, 120)
     warmup_dwell_row = self._min_max_row(QSpinBox, 1, 3600, 8, 16)
@@ -951,7 +976,7 @@ class UiMainWindow(QMainWindow):
       "Each profile runs this many keywords, then closes. "
       "Next profile continues from the next keyword batch."
     )
-    target_form.addRow("Target Domain:", self.target_domain)
+    target_form.addRow("Target Domains (max 5):", self.target_domains_edit)
     target_form.addRow("Next Profile Launch Interval (sec):", self._wrap_row(launch_row))
     target_form.addRow("Target Site Dwell Time (sec):", self._wrap_row(dwell_row))
     target_form.addRow("Warm-up Dwell Time (sec):", self._wrap_row(warmup_dwell_row))
@@ -1054,6 +1079,15 @@ class UiMainWindow(QMainWindow):
     total_box.addWidget(total_title, alignment=Qt.AlignmentFlag.AlignRight)
     total_box.addWidget(self.result_total_clicks_value, alignment=Qt.AlignmentFlag.AlignRight)
 
+    traffic_box = QVBoxLayout()
+    traffic_box.setSpacing(1)
+    traffic_title = QLabel("Traffic")
+    traffic_title.setObjectName("trafficTotalTitle")
+    self.result_traffic_value = QLabel("0 B")
+    self.result_traffic_value.setObjectName("trafficTotalValue")
+    traffic_box.addWidget(traffic_title, alignment=Qt.AlignmentFlag.AlignRight)
+    traffic_box.addWidget(self.result_traffic_value, alignment=Qt.AlignmentFlag.AlignRight)
+
     failed_box = QVBoxLayout()
     failed_box.setSpacing(1)
     failed_title = QLabel("Not Found")
@@ -1065,6 +1099,7 @@ class UiMainWindow(QMainWindow):
 
     stats_row.addStretch()
     stats_row.addLayout(total_box)
+    stats_row.addLayout(traffic_box)
     stats_row.addLayout(failed_box)
 
     header_row.addWidget(sessions_title, stretch=1)
@@ -1072,23 +1107,49 @@ class UiMainWindow(QMainWindow):
 
     body_row = QHBoxLayout()
     body_row.setSpacing(12)
+
+    sessions_panel = QWidget()
+    sessions_panel_layout = QVBoxLayout(sessions_panel)
+    sessions_panel_layout.setContentsMargins(0, 0, 0, 0)
+    sessions_panel_layout.setSpacing(8)
     self.result_session_list = QListWidget()
     self.result_session_list.setObjectName("resultSessionList")
+    sessions_actions = QHBoxLayout()
+    sessions_actions.setSpacing(8)
+    self.btn_delete_result_session = QPushButton("Delete")
+    self.btn_delete_result_session.setObjectName("btnDeleteResult")
+    self.btn_delete_result_session.setToolTip("Delete the selected session and its CSV file")
+    sessions_actions.addWidget(self.btn_delete_result_session)
+    sessions_actions.addStretch()
+    sessions_panel_layout.addWidget(self.result_session_list, stretch=1)
+    sessions_panel_layout.addLayout(sessions_actions)
 
     table_panel = QWidget()
     table_panel_layout = QVBoxLayout(table_panel)
     table_panel_layout.setContentsMargins(0, 0, 0, 0)
     table_panel_layout.setSpacing(8)
-    table_toolbar = QHBoxLayout()
-    table_toolbar.setSpacing(8)
-    self.btn_result_keyword_clicks = QPushButton("Keyword Clicks")
-    self.btn_result_keyword_clicks.setObjectName("btnKeywordClicks")
-    self.btn_result_keyword_clicks.setCheckable(True)
-    self.btn_result_keyword_clicks.setToolTip(
-      "Show per-keyword click totals (Windows / mobile), sorted by total clicks"
-    )
-    table_toolbar.addWidget(self.btn_result_keyword_clicks)
-    table_toolbar.addStretch()
+    self.result_domain_toolbar = QWidget()
+    self.result_domain_toolbar_layout = QHBoxLayout(self.result_domain_toolbar)
+    self.result_domain_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+    self.result_domain_toolbar_layout.setSpacing(8)
+    self.result_domain_button_group = QButtonGroup(self.result_domain_toolbar)
+    self.result_domain_button_group.setExclusive(True)
+    self.btn_result_all_clicks = QPushButton("All Clicks")
+    self.btn_result_all_clicks.setObjectName("btnKeywordClicks")
+    self.btn_result_all_clicks.setCheckable(True)
+    self.btn_result_all_clicks.setChecked(True)
+    self.btn_result_all_clicks.setToolTip("Show every click row for this session")
+    self.result_domain_button_group.addButton(self.btn_result_all_clicks)
+    self.result_domain_toolbar_layout.addWidget(self.btn_result_all_clicks)
+    self.result_click_domain_label = QLabel("Site:")
+    self.result_click_domain_label.setObjectName("resultClickDomainLabel")
+    self.result_domain_toolbar_layout.addWidget(self.result_click_domain_label)
+    self.result_click_domain_combo = QComboBox()
+    self.result_click_domain_combo.setObjectName("resultClickDomainCombo")
+    self.result_click_domain_combo.setMinimumWidth(180)
+    self.result_click_domain_combo.setToolTip("Filter All Clicks rows by target site")
+    self.result_domain_toolbar_layout.addWidget(self.result_click_domain_combo)
+    self.result_domain_toolbar_layout.addStretch()
 
     self.result_table = QTableWidget(0, 0)
     self.result_table.setObjectName("resultTable")
@@ -1099,10 +1160,10 @@ class UiMainWindow(QMainWindow):
     result_header = self.result_table.horizontalHeader()
     result_header.setStretchLastSection(True)
 
-    table_panel_layout.addLayout(table_toolbar)
+    table_panel_layout.addWidget(self.result_domain_toolbar)
     table_panel_layout.addWidget(self.result_table, stretch=1)
 
-    body_row.addWidget(self.result_session_list, stretch=1)
+    body_row.addWidget(sessions_panel, stretch=1)
     body_row.addWidget(table_panel, stretch=3)
 
     footer_row = QHBoxLayout()
@@ -1122,9 +1183,16 @@ class UiMainWindow(QMainWindow):
     self._result_loaded_path: Path | None = None
     self._result_loaded_headers: list[str] = []
     self._result_loaded_rows: list[list[str]] = []
+    self._result_loaded_meta: dict[str, str] = {}
+    self._result_session_domains: list[str] = []
+    self._result_table_filter: str = "all"
+    self._result_click_domain_filter: str = "all"
+    self._result_domain_buttons: list[QPushButton] = []
     self.result_session_list.currentItemChanged.connect(self._on_result_session_selected)
     self.btn_refresh_results.clicked.connect(self._refresh_result_file_list)
-    self.btn_result_keyword_clicks.toggled.connect(self._on_result_keyword_clicks_toggled)
+    self.btn_delete_result_session.clicked.connect(self._delete_selected_result_session)
+    self.result_domain_button_group.buttonClicked.connect(self._on_result_domain_filter_clicked)
+    self.result_click_domain_combo.currentIndexChanged.connect(self._on_result_click_domain_combo_changed)
     QTimer.singleShot(0, self._refresh_result_file_list)
     return tab
 
@@ -1177,20 +1245,40 @@ class UiMainWindow(QMainWindow):
 
   def _clear_result_session_view(self) -> None:
     self.result_total_clicks_value.setText("0")
+    self.result_traffic_value.setText("0 B")
     self.result_not_found_value.setText("0")
     self._result_loaded_path = None
     self._result_loaded_headers = []
     self._result_loaded_rows = []
+    self._result_loaded_meta = {}
+    self._result_session_domains = []
+    self._result_table_filter = "all"
+    self._result_click_domain_filter = "all"
+    self._rebuild_result_domain_buttons()
     self.result_table.clear()
     self.result_table.setRowCount(0)
     self.result_table.setColumnCount(0)
 
   def _load_result_session(self, path: Path) -> None:
-    headers, rows = SessionClickCsvLogger.read_rows(path)
+    headers, rows, meta = read_session_click_file(path)
     self._result_loaded_path = path
     self._result_loaded_headers = headers
     self._result_loaded_rows = rows
+    self._result_loaded_meta = meta
+    self._result_session_domains = session_target_domains(headers, rows, meta)
+    self._result_table_filter = "all"
+    self._result_click_domain_filter = "all"
     self.result_total_clicks_value.setText(str(len(rows)))
+
+    traffic_raw = (meta.get("traffic_bytes") or "").strip()
+    try:
+      traffic_bytes = int(traffic_raw) if traffic_raw else 0
+    except ValueError:
+      traffic_bytes = 0
+    active_path = (self._session_click_log_path or "").strip()
+    if active_path and Path(active_path).resolve() == path.resolve():
+      traffic_bytes = max(traffic_bytes, self._controller.get_session_traffic_total())
+    self.result_traffic_value.setText(self._format_bytes(traffic_bytes))
 
     session_start, session_end = session_result_window(path, self._result_session_files)
     not_found = 0
@@ -1201,22 +1289,115 @@ class UiMainWindow(QMainWindow):
         session_log_path=self._project_root / "data" / "session.log",
       )
     self.result_not_found_value.setText(str(not_found))
+    self._rebuild_result_domain_buttons()
     self._render_result_table()
 
-  def _on_result_keyword_clicks_toggled(self, checked: bool) -> None:
-    self.btn_result_keyword_clicks.setText("All Clicks" if checked else "Keyword Clicks")
-    if self._result_loaded_path is not None:
+  def _rebuild_result_domain_buttons(self) -> None:
+    self.result_domain_button_group.blockSignals(True)
+    try:
+      for button in list(self._result_domain_buttons):
+        self.result_domain_button_group.removeButton(button)
+        self.result_domain_toolbar_layout.removeWidget(button)
+        button.deleteLater()
+      self._result_domain_buttons.clear()
+
+      self.btn_result_all_clicks.setChecked(self._result_table_filter == "all")
+      for domain in self._result_session_domains:
+        button = QPushButton(domain)
+        button.setObjectName("btnKeywordClicks")
+        button.setCheckable(True)
+        button.setProperty("result_domain", domain)
+        button.setToolTip(f"Keyword click totals for {domain}")
+        if self._result_table_filter == domain:
+          button.setChecked(True)
+          self.btn_result_all_clicks.setChecked(False)
+        self.result_domain_button_group.addButton(button)
+        self.result_domain_toolbar_layout.insertWidget(
+          self.result_domain_toolbar_layout.count() - 1,
+          button,
+        )
+        self._result_domain_buttons.append(button)
+      self._rebuild_result_click_domain_combo()
+    finally:
+      self.result_domain_button_group.blockSignals(False)
+
+  def _rebuild_result_click_domain_combo(self) -> None:
+    self.result_click_domain_combo.blockSignals(True)
+    try:
+      current = self._result_click_domain_filter
+      self.result_click_domain_combo.clear()
+      self.result_click_domain_combo.addItem("All", "all")
+      for domain in self._result_session_domains:
+        self.result_click_domain_combo.addItem(domain, domain)
+      index = self.result_click_domain_combo.findData(current)
+      if index < 0:
+        index = 0
+        self._result_click_domain_filter = "all"
+      self.result_click_domain_combo.setCurrentIndex(index)
+    finally:
+      self.result_click_domain_combo.blockSignals(False)
+
+  def _on_result_click_domain_combo_changed(self, _index: int) -> None:
+    value = str(self.result_click_domain_combo.currentData() or "all").strip() or "all"
+    self._result_click_domain_filter = value
+    if self._result_table_filter == "all":
       self._render_result_table()
 
+  def _on_result_domain_filter_clicked(self, button) -> None:
+    if button is self.btn_result_all_clicks:
+      self._result_table_filter = "all"
+      self.result_click_domain_combo.setEnabled(True)
+      self.result_click_domain_label.setEnabled(True)
+    else:
+      domain = str(button.property("result_domain") or button.text() or "").strip()
+      self._result_table_filter = domain or "all"
+      self.result_click_domain_combo.setEnabled(False)
+      self.result_click_domain_label.setEnabled(False)
+    self._render_result_table()
+
+  def _delete_selected_result_session(self) -> None:
+    current = self.result_session_list.currentItem()
+    if current is None:
+      self.append_log("[UI] No session selected to delete.")
+      return
+    path_text = str(current.data(Qt.ItemDataRole.UserRole) or "").strip()
+    if not path_text:
+      return
+    path = Path(path_text)
+    label = format_result_session_label(path)
+    answer = QMessageBox.question(
+      self,
+      "Delete Session",
+      f"Delete session '{label}' and remove its CSV file?\n\n{path.name}",
+      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+      QMessageBox.StandardButton.No,
+    )
+    if answer != QMessageBox.StandardButton.Yes:
+      return
+    active_path = (self._session_click_log_path or "").strip()
+    if active_path and str(Path(active_path).resolve()) == str(path.resolve()):
+      self.append_log("[UI] Cannot delete the active in-progress session log.")
+      return
+    try:
+      if path.exists():
+        path.unlink()
+      self.append_log(f"[UI] Deleted session file: {path.name}")
+    except OSError as exc:
+      self.append_log(f"[UI] Failed to delete session file: {exc}")
+      return
+    self._refresh_result_file_list()
+
   def _render_result_table(self) -> None:
-    if self.btn_result_keyword_clicks.isChecked():
-      self._render_result_keyword_table()
+    if self._result_table_filter != "all":
+      self._render_result_keyword_table(self._result_table_filter)
     else:
       self._render_result_detail_table()
 
   def _render_result_detail_table(self) -> None:
     headers = self._result_loaded_headers
     rows = self._result_loaded_rows
+    if self._result_click_domain_filter != "all":
+      rows = filter_click_rows_by_domain(headers, rows, self._result_click_domain_filter)
     display_headers = headers or [
       "datetime",
       "profile_name",
@@ -1236,14 +1417,21 @@ class UiMainWindow(QMainWindow):
         self.result_table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
     self._resize_result_table_columns(len(display_headers))
 
-  def _render_result_keyword_table(self) -> None:
-    summaries = aggregate_keyword_clicks(self._result_loaded_headers, self._result_loaded_rows)
+  def _render_result_keyword_table(self, domain: str) -> None:
+    summaries = aggregate_keyword_clicks_for_domain(
+      self._result_loaded_headers,
+      self._result_loaded_rows,
+      domain,
+    )
     display_headers = ("keyword", "total_clicks", "windows", "mobile")
     self.result_table.setColumnCount(len(display_headers))
     self.result_table.setHorizontalHeaderLabels(
       ["Keyword", "Total Clicks", "Windows", "Mobile"]
     )
-    self.result_table.setRowCount(len(summaries))
+    total_clicks = sum(summary["total"] for summary in summaries)
+    total_windows = sum(summary["windows"] for summary in summaries)
+    total_mobile = sum(summary["mobile"] for summary in summaries)
+    self.result_table.setRowCount(len(summaries) + 1)
     for row_index, summary in enumerate(summaries):
       values = (
         summary["keyword"],
@@ -1253,6 +1441,15 @@ class UiMainWindow(QMainWindow):
       )
       for col_index, value in enumerate(values):
         self.result_table.setItem(row_index, col_index, QTableWidgetItem(value))
+
+    footer_row = len(summaries)
+    footer_font = QFont()
+    footer_font.setBold(True)
+    footer_values = ("Total", str(total_clicks), str(total_windows), str(total_mobile))
+    for col_index, value in enumerate(footer_values):
+      item = QTableWidgetItem(value)
+      item.setFont(footer_font)
+      self.result_table.setItem(footer_row, col_index, item)
     self._resize_result_table_columns(len(display_headers))
 
   def _resize_result_table_columns(self, column_count: int) -> None:
@@ -1633,7 +1830,8 @@ class UiMainWindow(QMainWindow):
       "llm_api_key": cursor_key,
       "llm_base_url": "https://api.cursor.com/v1",
       "llm_model": cursor_model,
-      "target_domain": self.target_domain.text().strip(),
+      "target_domains_text": self.target_domains_edit.toPlainText(),
+      "target_domain": self._primary_target_domain_from_ui(),
       "launch_interval_min": self.launch_min.value(),
       "launch_interval_max": self.launch_max.value(),
       "dwell_min": self.dwell_min.value(),
@@ -1672,7 +1870,11 @@ class UiMainWindow(QMainWindow):
     self.cursor_model.setCurrentText(
       normalize_cursor_model(data.get("cursor_model") or data.get("llm_model") or DEFAULT_CURSOR_MODEL)
     )
-    self.target_domain.setText(data.get("target_domain", ""))
+    legacy_target = data.get("target_domain", "").strip()
+    domains_text = data.get("target_domains_text", "").strip()
+    if not domains_text and legacy_target:
+      domains_text = legacy_target
+    self.target_domains_edit.setPlainText(domains_text)
     self.launch_min.setValue(int(data.get("launch_interval_min", self.launch_min.value())))
     self.launch_max.setValue(int(data.get("launch_interval_max", self.launch_max.value())))
     self.dwell_min.setValue(int(data.get("dwell_min", self.dwell_min.value())))
@@ -1727,10 +1929,30 @@ class UiMainWindow(QMainWindow):
   def _on_profile_healing_finished(self, profile_id: str, status_key: str, display_text: str) -> None:
     self._on_profile_update(profile_id, status_key, display_text)
 
+  def _parse_target_domains_from_ui(self) -> list[str]:
+    lines = [line.strip() for line in self.target_domains_edit.toPlainText().splitlines() if line.strip()]
+    seen: set[str] = set()
+    domains: list[str] = []
+    for line in lines:
+      key = line.lower().removeprefix("www.")
+      if key in seen:
+        continue
+      seen.add(key)
+      domains.append(line)
+      if len(domains) >= 5:
+        break
+    return domains
+
+  def _primary_target_domain_from_ui(self) -> str:
+    domains = self._parse_target_domains_from_ui()
+    return domains[0] if domains else ""
+
   def _build_config(self, require_lists: bool = True) -> BotConfig:
-    target = self.target_domain.text().strip()
-    if require_lists and not target:
-      raise ValueError("Target domain is required.")
+    target_domains = self._parse_target_domains_from_ui()
+    if require_lists and not target_domains:
+      raise ValueError("At least one target domain is required (max 5).")
+    if len([line for line in self.target_domains_edit.toPlainText().splitlines() if line.strip()]) > 5:
+      raise ValueError("At most 5 target domains are allowed.")
 
     keywords = [k.strip() for k in self.keywords_edit.toPlainText().splitlines() if k.strip()]
     if require_lists and not keywords:
@@ -1765,7 +1987,8 @@ class UiMainWindow(QMainWindow):
       capsolver_api_key=self.capsolver_key.text().strip(),
       adspower_api_url=self.adspower_api_url.text().strip(),
       adspower_api_key=self.adspower_api_key.text().strip(),
-      target_domain=target,
+      target_domain=target_domains[0] if target_domains else "",
+      target_domains=target_domains,
       proxies=proxies,
       keywords=keywords,
       warmup_queries=warmup,
@@ -1980,7 +2203,30 @@ class UiMainWindow(QMainWindow):
       manager = AdsPowerManager(config.adspower_url, config.adspower_api_key, self.append_log)
       for profile_id in profile_ids:
         self._controller.force_terminate(profile_id, config)
-      manager.delete_profiles(profile_ids)
+      time.sleep(4.0)
+      last_exc: Exception | None = None
+      for attempt in range(1, 5):
+        try:
+          manager.delete_profiles(profile_ids)
+          last_exc = None
+          break
+        except Exception as exc:
+          last_exc = exc
+          message = str(exc).lower()
+          if attempt < 4 and (
+            "being used by other users" in message
+            or "cannot be deleted" in message
+          ):
+            wait_seconds = min(30.0, 4.0 * attempt)
+            self.append_log(
+              f"[UI] Delete retry {attempt}/4 for {len(profile_ids)} profile(s) "
+              f"in {wait_seconds:.0f}s..."
+            )
+            time.sleep(wait_seconds)
+            continue
+          raise
+      if last_exc is not None:
+        raise last_exc
       deleted_set = set(profile_ids)
       self._profiles = [p for p in self._profiles if p.profile_id not in deleted_set]
       for profile_id in profile_ids:
@@ -1995,6 +2241,7 @@ class UiMainWindow(QMainWindow):
     path = new_session_click_log_path("data")
     config.session_click_log_path = str(path)
     self._session_click_log_path = str(path)
+    SessionClickCsvLogger(path, target_domains=config.get_target_domains())
     self.append_log(f"[UI] Click log file: {path}")
     if hasattr(self, "result_session_list"):
       QTimer.singleShot(0, self._refresh_result_file_list)
@@ -2003,6 +2250,33 @@ class UiMainWindow(QMainWindow):
   def _reset_overall_clicks(self) -> None:
     self._overall_clicks_session = 0
     self.overall_clicks_value_label.setText("0")
+
+  def _reset_session_traffic(self) -> None:
+    self._session_traffic_total = 0
+    self.proxy_traffic_total_label.setText("0 B")
+    self._controller.reset_session_traffic()
+    self._profile_traffic_totals.clear()
+
+  def _finalize_session_click_log(self) -> None:
+    path = (self._session_click_log_path or "").strip()
+    if not path:
+      return
+    traffic_bytes = self._controller.get_session_traffic_total()
+    try:
+      SessionClickCsvLogger.finalize_session(path, traffic_bytes=traffic_bytes)
+      self.append_log(
+        f"[UI] Session log finalized: traffic={self._format_bytes(traffic_bytes)}"
+      )
+    except OSError as exc:
+      self.append_log(f"[UI] Failed to finalize session log: {exc}")
+    active_path = Path(path)
+    if (
+      self._result_loaded_path is not None
+      and self._result_loaded_path.resolve() == active_path.resolve()
+    ):
+      self._load_result_session(active_path)
+    elif self.tabs.currentIndex() == getattr(self, "_result_tab_index", -1):
+      self._refresh_result_file_list()
 
   def _refresh_overall_clicks(self) -> None:
     path = (self._session_click_log_path or "").strip()
@@ -2034,6 +2308,7 @@ class UiMainWindow(QMainWindow):
       return
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
+    self._reset_session_traffic()
     started = 0
     for profile_id in profile_ids:
       if self._controller.start_profile_manual(profile_id, config):
@@ -2351,6 +2626,7 @@ class UiMainWindow(QMainWindow):
     self.present_cycle_value_label.setText(f"0 / {config.automation_cycles}")
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
+    self._reset_session_traffic()
     cleared = self._controller.clear_keyword_exclusions(config.target_domain)
     if cleared:
       self.append_log(
@@ -2377,6 +2653,7 @@ class UiMainWindow(QMainWindow):
     self._controller.stop_global()
 
   def _on_global_finished(self) -> None:
+    self._finalize_session_click_log()
     self._set_global_running(False)
     self.append_log("[UI] Automated bot stopped.")
     if self._pending_live_refresh:
@@ -2395,6 +2672,7 @@ class UiMainWindow(QMainWindow):
       return
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
+    self._reset_session_traffic()
     self._controller.start_profile_manual(profile_id, config)
 
   def _on_row_pause(self, profile_id: str) -> None:

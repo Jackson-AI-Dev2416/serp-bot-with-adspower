@@ -1,8 +1,9 @@
 """
 Playwright network route interception for residential proxy traffic minimization.
 
-Preserves Google search, cookies, JS, GA4/GTM, and target-site analytics while
-blocking heavy assets, ads, and non-essential third-party trackers.
+Preserves Google search, cookies, JS, GA4/GTM, Wix runtime bundles, and
+target-site analytics while blocking heavy assets, ads, and non-essential
+third-party trackers.
 """
 
 from __future__ import annotations
@@ -212,10 +213,14 @@ class NetworkOptimizer:
     "/j/collect",
     "/mp/collect",
     "/r/collect",
+    "/ccm/collect",
     "google-analytics.com/analytics.js",
     "googletagmanager.com/gtm.js",
     "googletagmanager.com/gtag/",
     "measurement protocol",
+  )
+  _WIX_RUNTIME_HOSTS = (
+    "parastorage.com",
   )
   _CAPTCHA_TOKENS = (
     "recaptcha",
@@ -243,8 +248,19 @@ class NetworkOptimizer:
     log: Callable[[str], None],
     *,
     profile_name: str = "",
+    target_hosts: list[str] | None = None,
   ) -> None:
-    self.target_host = (target_host or "").lower().removeprefix("www.")
+    hosts: list[str] = []
+    for raw in (target_hosts or []):
+      normalized = (raw or "").lower().removeprefix("www.")
+      if normalized and normalized not in hosts:
+        hosts.append(normalized)
+    if not hosts and (target_host or "").strip():
+      normalized = (target_host or "").lower().removeprefix("www.")
+      if normalized:
+        hosts.append(normalized)
+    self.target_hosts = hosts
+    self.target_host = hosts[0] if hosts else (target_host or "").lower().removeprefix("www.")
     self.log = log
     self.profile_name = profile_name
     self.phase = PagePhase.DEFAULT
@@ -253,6 +269,8 @@ class NetworkOptimizer:
     self._route_attached = False
     self._mobile_routed_pages: set[int] = set()
     self._blocked_by_type: dict[str, int] = {}
+    self._blocked_script_log_count = 0
+    self._blocked_script_log_limit = 8
 
   def set_phase(self, phase: PagePhase) -> None:
     if phase != self.phase:
@@ -260,12 +278,9 @@ class NetworkOptimizer:
     self.phase = phase
 
   def apply_phase_headers(self, page: Page) -> None:
-    """Target site only: request reduced-data hint. SERP keeps a normal browser profile."""
+    """Keep a normal browser header profile (no Save-Data hint on target site)."""
     try:
-      if self.phase == PagePhase.TARGET_SITE:
-        page.context.set_extra_http_headers({"Save-Data": "on"})
-      else:
-        page.context.set_extra_http_headers({})
+      page.context.set_extra_http_headers({})
     except Exception:
       pass
 
@@ -288,6 +303,8 @@ class NetworkOptimizer:
       try:
         if self.should_abort(request):
           kind = request.resource_type or "other"
+          if self.phase == PagePhase.TARGET_SITE and kind == "script":
+            self._log_blocked_script(request.url or "")
           self._blocked_by_type[kind] = self._blocked_by_type.get(kind, 0) + 1
           self.monitor.record_blocked(request)
           route.abort()
@@ -331,6 +348,13 @@ class NetworkOptimizer:
     parts = ", ".join(f"{k}={v}" for k, v in sorted(self._blocked_by_type.items()))
     self.log(f"[Network] Blocked {total} requests ({parts})")
 
+  def _log_blocked_script(self, url: str) -> None:
+    if self._blocked_script_log_count >= self._blocked_script_log_limit:
+      return
+    self._blocked_script_log_count += 1
+    short = (url or "").strip()[:140]
+    self.log(f"[Network] Blocked script: {short}")
+
   def report_traffic(self, *, force: bool = False, include_baseline: bool = False) -> None:
     if not force and self.monitor.request_count <= 0:
       return
@@ -350,6 +374,8 @@ class NetworkOptimizer:
     resource_type = (request.resource_type or "").lower()
 
     if self.is_ga_whitelisted(url, host):
+      return False
+    if self.is_wix_runtime_whitelisted(url, host, resource_type):
       return False
     if self.is_captcha_or_security_url(url, host):
       return False
@@ -422,6 +448,8 @@ class NetworkOptimizer:
     if resource_type == "script":
       if self.is_ga_whitelisted(url, host):
         return False
+      if self.is_wix_runtime_whitelisted(url, host, resource_type):
+        return False
       if self._host_matches_target(host):
         return False
       if self._is_ad_host(host, url) or self._is_tracker_host(host, url):
@@ -475,7 +503,21 @@ class NetworkOptimizer:
       return True
     if host.endswith("stats.g.doubleclick.net") and ("/collect" in url or "/g/collect" in url):
       return True
+    if cls._is_google_host(host) and "/ccm/collect" in url:
+      return True
     return any(token in url for token in cls._GA_URL_TOKENS)
+
+  @classmethod
+  def is_wix_runtime_whitelisted(cls, url: str, host: str, resource_type: str) -> bool:
+    """Allow Wix thunderbolt/service JS bundles required for site + GA bootstrap."""
+    if (resource_type or "").lower() != "script":
+      return False
+    if not any(host == domain or host.endswith(f".{domain}") for domain in cls._WIX_RUNTIME_HOSTS):
+      return False
+    path = urlparse(url).path.lower()
+    if "/services/" in path:
+      return True
+    return path.endswith(".js")
 
   @classmethod
   def is_ip_check_url(cls, host: str) -> bool:
@@ -525,9 +567,12 @@ class NetworkOptimizer:
     return any(token in url for token in heavy_tokens)
 
   def _host_matches_target(self, host: str) -> bool:
-    if not self.target_host:
+    if not self.target_hosts:
       return False
-    return host == self.target_host or host.endswith(f".{self.target_host}")
+    for target_host in self.target_hosts:
+      if host == target_host or host.endswith(f".{target_host}"):
+        return True
+    return False
 
   @classmethod
   def _is_ad_host(cls, host: str, url: str) -> bool:

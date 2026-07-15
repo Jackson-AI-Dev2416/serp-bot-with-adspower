@@ -10,6 +10,7 @@ class BotConfig:
   adspower_api_key: str = ""
   adspower_group_id: str = "0"
   target_domain: str = ""
+  target_domains: List[str] = field(default_factory=list)
   proxies: List[Tuple[str, int, str, str]] = field(default_factory=list)
   keywords: List[str] = field(default_factory=list)
   warmup_queries: List[str] = field(default_factory=list)
@@ -38,6 +39,27 @@ class BotConfig:
   llm_api_key: str = ""
   llm_base_url: str = "https://api.openai.com/v1"
   llm_model: str = "gpt-4o-mini"
+
+  def get_target_domains(self) -> List[str]:
+    raw = [d.strip() for d in (self.target_domains or []) if d and d.strip()]
+    if not raw and (self.target_domain or "").strip():
+      raw = [self.target_domain.strip()]
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for domain in raw:
+      key = domain.lower().removeprefix("www.")
+      if key in seen:
+        continue
+      seen.add(key)
+      ordered.append(domain)
+      if len(ordered) >= 5:
+        break
+    return ordered
+
+  @property
+  def primary_target_domain(self) -> str:
+    domains = self.get_target_domains()
+    return domains[0] if domains else (self.target_domain or "").strip()
 
   @property
   def adspower_url(self) -> str:

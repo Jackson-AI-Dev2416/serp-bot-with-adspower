@@ -1,5 +1,6 @@
 import random
 import threading
+import time
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -138,8 +139,10 @@ class ProfileWorkerThread(QThread):
     if not keywords:
       return []
     max_per_profile = max(1, int(self.config.max_keywords_per_profile or len(keywords)))
+
     assigned = self.keyword_rotation.allocate(
-      target_domain=self.config.target_domain,
+      target_domain=self.config.primary_target_domain,
+      target_domains=self.config.get_target_domains(),
       keywords=keywords,
       batch_size=max_per_profile,
     )
@@ -171,17 +174,24 @@ class ProfileWorkerThread(QThread):
       adspower.force_terminate_profile(profile_id)
     except Exception as exc:
       self._emit_log(f"[{self.profile.name}] Force terminate warning: {exc}")
-    for attempt in range(1, 4):
+    self._emit_log(
+      f"[{self.profile.name}] Waiting 4s for AdsPower to release profile before delete"
+    )
+    self.stop_event.wait(4.0)
+    for attempt in range(1, 8):
       try:
         adspower.delete_profiles([profile_id])
         return True
       except Exception as exc:
-        self._emit_log(f"[{self.profile.name}] Delete retry {attempt}/3 failed ({reason}): {exc}")
+        self._emit_log(f"[{self.profile.name}] Delete retry {attempt}/7 failed ({reason}): {exc}")
         try:
           exists = adspower.verify_profile_ids([profile_id])
           if not exists:
             return True
         except Exception as verify_exc:
           self._emit_log(f"[{self.profile.name}] Verify delete failed: {verify_exc}")
-        self.stop_event.wait(0.8 * attempt)
+        backoff = min(30.0, 3.0 * (2 ** (attempt - 1)))
+        if AdsPowerManager._is_rate_limit_error(str(exc)):
+          backoff = max(backoff, min(45.0, 5.0 * attempt))
+        self.stop_event.wait(backoff)
     return False

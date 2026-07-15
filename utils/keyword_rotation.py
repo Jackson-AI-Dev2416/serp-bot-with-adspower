@@ -10,13 +10,23 @@ class KeywordRotationStore:
     self.path = Path(path)
     self._lock = threading.Lock()
 
-  def allocate(self, target_domain: str, keywords: list[str], batch_size: int) -> list[str]:
+  def allocate(
+    self,
+    target_domain: str,
+    keywords: list[str],
+    batch_size: int,
+    *,
+    pool_id: str = "",
+    target_domains: list[str] | None = None,
+  ) -> list[str]:
     cleaned = [kw.strip() for kw in keywords if kw and kw.strip()]
     if not cleaned:
       return []
 
     batch = max(1, int(batch_size or 1))
-    key = self._rotation_key(target_domain)
+    key = self._rotation_key(target_domain, target_domains=target_domains)
+    if pool_id:
+      key = f"{key}:{pool_id}"
     signature = self._keywords_signature(cleaned)
 
     with self._lock:
@@ -68,15 +78,26 @@ class KeywordRotationStore:
     self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
   @staticmethod
-  def _rotation_key(target_domain: str) -> str:
-    host = (target_domain or "").strip().lower()
-    if host.startswith("http://"):
-      host = host[7:]
-    elif host.startswith("https://"):
-      host = host[8:]
-    host = host.split("/", 1)[0].strip()
-    host = host.removeprefix("www.")
-    return host or "default"
+  def _rotation_key(target_domain: str, *, target_domains: list[str] | None = None) -> str:
+    raw = [d.strip() for d in (target_domains or []) if d and d.strip()]
+    if not raw and (target_domain or "").strip():
+      raw = [target_domain.strip()]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for domain in raw:
+      host = domain.lower()
+      if host.startswith("http://"):
+        host = host[7:]
+      elif host.startswith("https://"):
+        host = host[8:]
+      host = host.split("/", 1)[0].strip().removeprefix("www.")
+      if not host or host in seen:
+        continue
+      seen.add(host)
+      normalized.append(host)
+    if not normalized:
+      return "default"
+    return "|".join(sorted(normalized))
 
   @staticmethod
   def _keywords_signature(keywords: list[str]) -> str:

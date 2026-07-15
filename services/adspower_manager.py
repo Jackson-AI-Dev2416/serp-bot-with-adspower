@@ -49,6 +49,10 @@ class ProfileSpec:
       return "iOS"
     return os_type[:1].upper() + os_type[1:]
 
+  @property
+  def is_mobile(self) -> bool:
+    return (self.os_type or "").lower().startswith(("android", "ios"))
+
 
 DEFAULT_PROXY_TYPE = "http"
 PROFILE_OS_POOL = ("Windows", "Android")
@@ -576,15 +580,21 @@ class AdsPowerManager:
       }
     return fingerprint
 
+  @staticmethod
+  def _build_browser_start_payload(profile_id: str) -> dict:
+    return {
+      "profile_id": profile_id,
+      "headless": "0",
+      "proxy_detection": "0",
+      "last_opened_tabs": "0",
+    }
+
   def start_profile(self, profile_id: str) -> str:
-    data = self._post(
-      self.START_PATH,
-      {
-        "profile_id": profile_id,
-        "headless": "0",
-        "open_tabs": "1",
-      },
+    payload = self._build_browser_start_payload(profile_id)
+    self.logger(
+      "[AdsPower] Start options: proxy_detection=0, last_opened_tabs=0"
     )
+    data = self._post(self.START_PATH, payload)
     ws_data = data.get("ws") or {}
     ws_endpoint = ws_data.get("puppeteer")
     if not ws_endpoint:
@@ -602,6 +612,7 @@ class AdsPowerManager:
 
   def force_terminate_profile(self, profile_id: str) -> None:
     self.stop_profile(profile_id)
+    time.sleep(1.5)
 
   def delete_profiles(self, profile_ids: List[str]) -> None:
     if not profile_ids:
