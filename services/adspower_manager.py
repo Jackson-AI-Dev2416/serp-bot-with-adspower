@@ -5,9 +5,11 @@ import json
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import requests
+
+from utils.app_paths import data_dir
 
 
 @dataclass
@@ -21,6 +23,8 @@ class ProfileSpec:
   os_type: str
   profile_no: str = ""
   is_active: bool = False
+  assigned_keyword: str = ""
+  assigned_domain: str = ""
 
   @property
   def os_browser_label(self) -> str:
@@ -73,11 +77,13 @@ class AdsPowerManager:
   UA_BATCH_LIMIT = 10
   LOCAL_ACTIVE_PATH = "/api/v1/browser/local-active"
   ACTIVE_PATH = "/api/v2/browser-profile/active"
-  PROFILE_NAME_COUNTER_PATH = Path("data/profile_name_counter.json")
   _name_counter_lock = threading.Lock()
   _api_lock = threading.Lock()
   _last_api_at = 0.0
   _MIN_API_INTERVAL_SEC = 1.15
+  API_TIMEOUT_DEFAULT_SEC = 90.0
+  API_TIMEOUT_CREATE_SEC = 25.0
+  API_TIMEOUT_STATUS_SEC = 10.0
 
   def __init__(self, base_url: str, api_key: str = "", logger: Optional[Callable[[str], None]] = None):
     self.base_url = base_url.rstrip("/")
@@ -101,17 +107,30 @@ class AdsPowerManager:
     text = (message or "").lower()
     return "too many request" in text or "rate limit" in text
 
-  def _request(self, method: str, path: str, payload: Optional[dict] = None) -> dict:
+  def _request(
+    self,
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    *,
+    timeout: Optional[float] = None,
+  ) -> dict:
     url = f"{self.base_url}{path}"
+    request_timeout = float(timeout if timeout is not None else self.API_TIMEOUT_DEFAULT_SEC)
     last_error = "unknown AdsPower API error"
     for attempt in range(1, 8):
       self._throttle_api()
       try:
         if method.upper() == "GET":
-          response = self.session.get(url, params=payload, timeout=90)
+          response = self.session.get(url, params=payload, timeout=request_timeout)
         else:
-          response = self.session.post(url, json=payload or {}, timeout=90)
+          response = self.session.post(url, json=payload or {}, timeout=request_timeout)
         response.raise_for_status()
+      except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+          f"AdsPower API timed out after {request_timeout:.0f}s ({path}). "
+          "AdsPower may be overloaded — retrying later is recommended."
+        ) from exc
       except requests.exceptions.ConnectionError as exc:
         raise RuntimeError(
           f"Cannot connect to AdsPower Local API ({self.base_url}). "
@@ -134,11 +153,43 @@ class AdsPowerManager:
       return body.get("data") or {}
     raise RuntimeError(last_error)
 
+  def wait_until_ready(
+    self,
+    *,
+    max_wait_sec: float = 120.0,
+    poll_sec: float = 5.0,
+    stopped: Optional[Callable[[], bool]] = None,
+  ) -> bool:
+    """Poll /status until AdsPower local API accepts connections."""
+    deadline = time.time() + max(5.0, float(max_wait_sec))
+    poll_sec = max(2.0, float(poll_sec))
+    attempt = 0
+    while time.time() < deadline:
+      if stopped and stopped():
+        return False
+      attempt += 1
+      ok, message = self.check_connection()
+      if ok:
+        if attempt > 1:
+          self.logger(f"[AdsPower] API ready after {attempt} check(s): {message}")
+        return True
+      remaining = max(0, int(deadline - time.time()))
+      self.logger(
+        f"[AdsPower] API not ready (attempt {attempt}, {remaining}s left): {message}"
+      )
+      slept = 0.0
+      while slept < poll_sec and time.time() < deadline:
+        if stopped and stopped():
+          return False
+        time.sleep(min(0.5, poll_sec - slept))
+        slept += 0.5
+    return False
+
   def check_connection(self) -> tuple[bool, str]:
     """Returns (ok, message) for GUI diagnostics."""
     try:
       url = f"{self.base_url}/status"
-      response = self.session.get(url, timeout=10)
+      response = self.session.get(url, timeout=self.API_TIMEOUT_STATUS_SEC)
       response.raise_for_status()
       body = response.json()
       if body.get("code") != 0:
@@ -149,11 +200,14 @@ class AdsPowerManager:
     except Exception as exc:
       return False, str(exc)
 
-  def _post(self, path: str, payload: dict) -> dict:
-    return self._request("POST", path, payload)
+  def _post(self, path: str, payload: dict, *, timeout: Optional[float] = None) -> dict:
+    return self._request("POST", path, payload, timeout=timeout)
 
-  def _get(self, path: str, params: Optional[dict] = None) -> dict:
-    return self._request("GET", path, params)
+  def _get(self, path: str, params: Optional[dict] = None, *, timeout: Optional[float] = None) -> dict:
+    return self._request("GET", path, params, timeout=timeout)
+
+  def _create_api_timeout(self) -> float:
+    return self.API_TIMEOUT_CREATE_SEC
 
   def _ensure_api_key(self) -> None:
     if not self.session.headers.get("Authorization"):
@@ -405,6 +459,7 @@ class AdsPowerManager:
     data = self._post(
       self.LIST_PATH,
       {"profile_id": profile_ids, "page": 1, "limit": max(len(profile_ids), 1)},
+      timeout=self._create_api_timeout(),
     )
     found: List[str] = []
     for item in data.get("list") or []:
@@ -429,6 +484,7 @@ class AdsPowerManager:
     total: int = 20,
     *,
     profile_os_mode: str = PROFILE_OS_MODE_MIXED,
+    forced_os_types: Optional[Sequence[str]] = None,
   ) -> List[ProfileSpec]:
     self._ensure_api_key()
     if total < 1:
@@ -443,19 +499,34 @@ class AdsPowerManager:
     if use_no_proxy:
       self.logger("[AdsPower] No proxies configured — creating profiles with no_proxy (test mode).")
 
-    os_pool = self.resolve_profile_os_pool(profile_os_mode)
-    os_plan = self._build_os_plan(total, os_pool=os_pool)
-    os_mix = {os_name: os_plan.count(os_name) for os_name in os_pool}
     mode_label = (profile_os_mode or PROFILE_OS_MODE_MIXED).strip().lower()
-    self.logger(
-      "[AdsPower] OS mix for batch: "
-      + ", ".join(f"{name}={count}" for name, count in os_mix.items() if count)
-      + f" (browser={PROFILE_BROWSER}, mode={mode_label})"
-    )
+    if forced_os_types is not None:
+      if len(forced_os_types) != total:
+        raise ValueError(
+          f"forced_os_types length ({len(forced_os_types)}) must match total ({total})"
+        )
+      os_plan = [self._normalize_os_type(value) for value in forced_os_types]
+    else:
+      os_pool = self.resolve_profile_os_pool(profile_os_mode)
+      os_plan = self._build_os_plan(total, os_pool=os_pool)
+    os_mix: dict[str, int] = {}
+    for os_name in os_plan:
+      os_mix[os_name] = os_mix.get(os_name, 0) + 1
+    mix_detail = ", ".join(f"{name}={count}" for name, count in os_mix.items() if count)
+    if forced_os_types is not None:
+      self.logger(
+        f"[AdsPower] OS plan for batch: {mix_detail} "
+        f"(browser={PROFILE_BROWSER}, mode={mode_label}, history-routed)"
+      )
+    else:
+      self.logger(
+        f"[AdsPower] OS mix for batch: {mix_detail} "
+        f"(browser={PROFILE_BROWSER}, mode={mode_label})"
+      )
 
     specs: List[ProfileSpec] = []
     for assignment_index, os_type in enumerate(os_plan):
-      name = self._next_profile_name()
+      name = self._peek_profile_name()
       if use_no_proxy:
         host, port, user, password = "—", 0, "", ""
         user_proxy_config = {"proxy_soft": "no_proxy"}
@@ -467,11 +538,11 @@ class AdsPowerManager:
       payload = {
         "name": name,
         "group_id": str(group_id),
-        "tabs": ["about:blank"],
+        "tabs": [self.GOOGLE_ENTRY_URL],
         "user_proxy_config": user_proxy_config,
         "fingerprint_config": self._build_fingerprint(os_type),
       }
-      data = self._post(self.CREATE_PATH, payload)
+      data = self._post(self.CREATE_PATH, payload, timeout=self._create_api_timeout())
       profile_id = str(data.get("profile_id") or data.get("id") or "")
       profile_no = str(data.get("profile_no") or "")
       if not profile_id:
@@ -489,6 +560,7 @@ class AdsPowerManager:
           profile_no=profile_no,
         )
       )
+      self._commit_profile_name(name)
       suffix = f" (no={profile_no})" if profile_no else ""
       self.logger(f"[AdsPower] Created profile {name} [{os_type}/{PROFILE_BROWSER}] -> {profile_id}{suffix}")
       time.sleep(1.1)
@@ -504,31 +576,52 @@ class AdsPowerManager:
 
     return specs
 
-  def _next_profile_name(self) -> str:
+  def _profile_name_counter_path(self) -> Path:
+    return data_dir() / "profile_name_counter.json"
+
+  def _read_profile_name_counter(self) -> int:
+    counter_path = self._profile_name_counter_path()
+    if not counter_path.exists():
+      return 0
+    try:
+      parsed = json.loads(counter_path.read_text(encoding="utf-8"))
+      return max(0, int(parsed.get("last_index", 0) or 0))
+    except Exception:
+      return 0
+
+  def _write_profile_name_counter(self, value: int) -> None:
+    counter_path = self._profile_name_counter_path()
+    counter_path.parent.mkdir(parents=True, exist_ok=True)
+    counter_path.write_text(
+      json.dumps({"last_index": max(0, int(value))}, ensure_ascii=True, indent=2),
+      encoding="utf-8",
+    )
+
+  def _peek_profile_name(self) -> str:
     with self._name_counter_lock:
-      current = 0
-      if self.PROFILE_NAME_COUNTER_PATH.exists():
-        try:
-          parsed = json.loads(self.PROFILE_NAME_COUNTER_PATH.read_text(encoding="utf-8"))
-          current = int(parsed.get("last_index", 0) or 0)
-        except Exception:
-          current = 0
-      current += 1
-      self.PROFILE_NAME_COUNTER_PATH.parent.mkdir(parents=True, exist_ok=True)
-      self.PROFILE_NAME_COUNTER_PATH.write_text(
-        json.dumps({"last_index": current}, ensure_ascii=True, indent=2),
-        encoding="utf-8",
-      )
+      return f"s-{self._read_profile_name_counter() + 1:03d}"
+
+  def _commit_profile_name(self, name: str) -> None:
+    try:
+      index = int(str(name).rsplit("-", 1)[-1])
+    except (TypeError, ValueError):
+      return
+    with self._name_counter_lock:
+      current = self._read_profile_name_counter()
+      if index > current:
+        self._write_profile_name_counter(index)
+
+  def _next_profile_name(self) -> str:
+    """Legacy helper — prefer peek + commit after AdsPower create succeeds."""
+    with self._name_counter_lock:
+      current = self._read_profile_name_counter() + 1
+      self._write_profile_name_counter(current)
     return f"s-{current:03d}"
 
   def reset_profile_name_counter(self, start_index: int = 0) -> None:
     with self._name_counter_lock:
       value = max(0, int(start_index))
-      self.PROFILE_NAME_COUNTER_PATH.parent.mkdir(parents=True, exist_ok=True)
-      self.PROFILE_NAME_COUNTER_PATH.write_text(
-        json.dumps({"last_index": value}, ensure_ascii=True, indent=2),
-        encoding="utf-8",
-      )
+      self._write_profile_name_counter(value)
     self.logger(f"[AdsPower] Profile name counter reset to {value}")
 
   @staticmethod
@@ -554,6 +647,15 @@ class AdsPowerManager:
         f"({len(proxies)} configured). Each proxy is assigned once per batch."
       )
     return list(proxies[:total])
+
+  @staticmethod
+  def _normalize_os_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in ("android", PROFILE_OS_MODE_ANDROID_ONLY):
+      return "Android"
+    if normalized in ("windows", "win", PROFILE_OS_MODE_WINDOWS_ONLY):
+      return "Windows"
+    raise ValueError(f"Unsupported AdsPower OS type: {value!r}")
 
   @staticmethod
   def _build_os_plan(
@@ -602,6 +704,9 @@ class AdsPowerManager:
       }
     return fingerprint
 
+  BLANK_TAB_URL = "about:blank"
+  GOOGLE_ENTRY_URL = "https://www.google.co.kr/"
+
   @staticmethod
   def _build_browser_start_payload(profile_id: str) -> dict:
     return {
@@ -609,12 +714,14 @@ class AdsPowerManager:
       "headless": "0",
       "proxy_detection": "0",
       "last_opened_tabs": "0",
+      "tabs": [AdsPowerManager.GOOGLE_ENTRY_URL],
     }
 
   def start_profile(self, profile_id: str) -> str:
     payload = self._build_browser_start_payload(profile_id)
     self.logger(
-      "[AdsPower] Start options: proxy_detection=0, last_opened_tabs=0"
+      f"[AdsPower] Start options: proxy_detection=0, last_opened_tabs=0, "
+      f"tabs=[{self.GOOGLE_ENTRY_URL}]"
     )
     data = self._post(self.START_PATH, payload)
     ws_data = data.get("ws") or {}

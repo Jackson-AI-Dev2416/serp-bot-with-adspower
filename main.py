@@ -1,9 +1,10 @@
+import os
 import sys
-from pathlib import Path
 
-from utils.cursor_sdk_windows_patch import apply_cursor_sdk_windows_patch
+from utils.app_paths import app_base_dir, ensure_data_dir
 
-apply_cursor_sdk_windows_patch()
+os.chdir(app_base_dir())
+ensure_data_dir()
 
 from PyQt6.QtWidgets import QApplication
 
@@ -11,7 +12,6 @@ from ui.main_window import UiMainWindow
 
 
 def main() -> None:
-  Path("data").mkdir(exist_ok=True)
   app = QApplication(sys.argv)
   app.setApplicationName("SERP Bot")
   window = UiMainWindow()

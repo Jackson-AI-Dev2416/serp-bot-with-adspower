@@ -20,6 +20,11 @@ from services.adspower_manager import AdsPowerManager, ProfileSpec
 from services.serp_bot import SerpBot
 from utils.keyword_exclusion import KeywordExclusionStore
 from utils.keyword_rotation import KeywordRotationStore
+from utils.pair_rotation import PairRotationStore
+from utils.session_log import append_session_log
+from utils.serp_result_store import SerpResultStore
+from utils.csv_logger import log_session_failure, outcome_to_failure_url
+from utils.user_log import build_pre_delete_log_line
 
 
 class BotWorkerThread(QThread):
@@ -27,10 +32,27 @@ class BotWorkerThread(QThread):
   _POST_TERMINATE_DELETE_DELAY_SECONDS = 4.0
   _ORPHAN_DELETE_DELAY_SECONDS = 180.0
   _FORCE_STOP_MIN_PROFILE_AGE_SECONDS = 45.0
+  _SESSION_STALL_SEC = 600.0
+  _PROFILE_STALL_POLL_SEC = 30.0
+
+  @staticmethod
+  def _profile_create_retry_delay(
+    failure_streak: int,
+    error_text: str,
+    launch_interval_min: float,
+  ) -> float:
+    streak = max(1, int(failure_streak))
+    msg = (error_text or "").lower()
+    base = max(10.0, float(launch_interval_min or 10))
+    if "cannot connect" in msg or "10061" in msg or "connection refused" in msg:
+      return min(60.0, 5.0 * (2 ** min(streak - 1, 3)))
+    if "timed out" in msg or "timeout" in msg:
+      return min(45.0, 15.0 + 5.0 * min(streak - 1, 5))
+    return min(30.0, base + 2.0 * min(streak - 1, 4))
 
   log = pyqtSignal(str)
   profile_update = pyqtSignal(str, str, str)
-  traffic_update = pyqtSignal(str, str, int)
+  traffic_update = pyqtSignal(str, str, "qint64", "qint64", "qint64", "qint64", "qint64", "qint64")
   cycle_progress = pyqtSignal(int, int)
   keyword_excluded = pyqtSignal(str)
   profiles_changed = pyqtSignal()
@@ -39,6 +61,7 @@ class BotWorkerThread(QThread):
   finished_ok = pyqtSignal()
   profile_finished = pyqtSignal(str, str)
   target_click_logged = pyqtSignal()
+  captcha_stat = pyqtSignal(str)
   error = pyqtSignal(str)
 
   def __init__(
@@ -47,6 +70,7 @@ class BotWorkerThread(QThread):
     profiles: List[ProfileSpec],
     keyword_rotation: KeywordRotationStore,
     keyword_exclusion: KeywordExclusionStore,
+    pair_rotation: Optional[PairRotationStore] = None,
     failure_callback=None,
     parent=None,
   ):
@@ -55,6 +79,8 @@ class BotWorkerThread(QThread):
     self.profiles = profiles
     self.keyword_rotation = keyword_rotation
     self.keyword_exclusion = keyword_exclusion
+    self.pair_rotation = pair_rotation or PairRotationStore()
+    self.result_store = SerpResultStore()
     self._failure_callback = failure_callback
     self._stop_requested = False
     self._profile_stop_events: Dict[str, threading.Event] = {}
@@ -70,8 +96,113 @@ class BotWorkerThread(QThread):
     self._orphan_delete_queue: Dict[str, str] = {}
     self._orphan_queue_lock = threading.Lock()
     self._orphan_sweeper_started = False
+    self._visit_site_started_at: Dict[str, float] = {}
+    self._dwell_force_timers: Dict[str, threading.Timer] = {}
+    self._profile_last_progress_at: Dict[str, float] = {}
+    self._profile_stall_stop_flags: Dict[str, threading.Event] = {}
+    self._session_exhausted_pairs: set[tuple[str, str]] = set()
+
+  @staticmethod
+  def _session_pair_key(keyword: str, domain: str) -> tuple[str, str]:
+    return PairRotationStore.pair_key(keyword, domain)
+
+  def _mark_session_pair_exhausted(self, keyword: str, domain: str) -> None:
+    key = self._session_pair_key(keyword, domain)
+    if key in self._session_exhausted_pairs:
+      return
+    self._session_exhausted_pairs.add(key)
+    self._emit_log(
+      f"[Worker] Session skip: '{keyword.strip()}' → {domain.strip()} "
+      "(full SERP to max pages, target not found — excluded until Stop/Start)"
+    )
+
+  def _dwell_force_stop_seconds(self) -> float:
+    dwell_max = float(getattr(self.config, "dwell_max", 180) or 180)
+    return dwell_max + 30.0
+
+  def _clear_dwell_tracking(self, profile_id: str) -> None:
+    self._visit_site_started_at.pop(profile_id, None)
+    timer = self._dwell_force_timers.pop(profile_id, None)
+    if timer:
+      timer.cancel()
+
+  def _touch_profile_progress(self, profile_id: str) -> None:
+    self._profile_last_progress_at[profile_id] = time.time()
+
+  def _start_session_stall_watchdog(
+    self,
+    profile: ProfileSpec,
+    manager: AdsPowerManager,
+    stop_event: threading.Event,
+  ) -> None:
+    stall_stop = threading.Event()
+    self._profile_stall_stop_flags[profile.profile_id] = stall_stop
+    self._touch_profile_progress(profile.profile_id)
+
+    def _poll() -> None:
+      while not stall_stop.is_set():
+        if stop_event.is_set():
+          return
+        last = self._profile_last_progress_at.get(profile.profile_id, 0.0)
+        if time.time() - last >= self._SESSION_STALL_SEC:
+          self._emit_log(
+            f"[Worker] Session stall watchdog: no progress for "
+            f"{int(self._SESSION_STALL_SEC // 60)} min on {profile.name} — forcing stop"
+          )
+          self._force_profile_stop_now(profile.profile_id, "Session stall watchdog")
+          try:
+            with self._lifecycle_lock:
+              manager.stop_profile(profile.profile_id)
+          except Exception as exc:
+            self._emit_log(f"[Worker] Stall watchdog AdsPower stop failed: {exc}")
+          return
+        stall_stop.wait(self._PROFILE_STALL_POLL_SEC)
+
+    threading.Thread(
+      target=_poll,
+      daemon=True,
+      name=f"stall-{profile.name}",
+    ).start()
+
+  def _stop_session_stall_watchdog(self, profile_id: str) -> None:
+    stall_stop = self._profile_stall_stop_flags.pop(profile_id, None)
+    if stall_stop:
+      stall_stop.set()
+    self._profile_last_progress_at.pop(profile_id, None)
+
+  def _force_profile_stop_now(self, profile_id: str, reason: str) -> None:
+    event = self._profile_stop_events.get(profile_id)
+    if event and not event.is_set():
+      self._emit_log(f"[Worker] {reason} for {profile_id}")
+      event.set()
+    with self._phase_lock:
+      self._graceful_stop_pending.discard(profile_id)
+
+  def _schedule_dwell_force_stop(self, profile_id: str) -> None:
+    existing = self._dwell_force_timers.pop(profile_id, None)
+    if existing:
+      existing.cancel()
+    started = self._visit_site_started_at.get(profile_id, time.time())
+    deadline = started + self._dwell_force_stop_seconds()
+    delay = max(0.5, deadline - time.time())
+    if delay <= 0.5:
+      self._force_profile_stop_now(profile_id, reason="Dwell budget exceeded")
+      return
+
+    def _fire() -> None:
+      self._dwell_force_timers.pop(profile_id, None)
+      self._force_profile_stop_now(profile_id, reason="Dwell force-stop timer")
+
+    timer = threading.Timer(delay, _fire)
+    timer.daemon = True
+    self._dwell_force_timers[profile_id] = timer
+    timer.start()
 
   def _on_profile_phase(self, profile_id: str, status_key: str) -> None:
+    if status_key == UiStatusKey.VISITING_SITE.value:
+      self._visit_site_started_at[profile_id] = time.time()
+    else:
+      self._clear_dwell_tracking(profile_id)
     with self._phase_lock:
       self._profile_phases[profile_id] = status_key
       pending = profile_id in self._graceful_stop_pending
@@ -94,6 +225,7 @@ class BotWorkerThread(QThread):
     if phase == UiStatusKey.VISITING_SITE.value:
       with self._phase_lock:
         self._graceful_stop_pending.add(profile_id)
+      self._schedule_dwell_force_stop(profile_id)
       self._emit_log(
         f"[Worker] Stop deferred for {profile_id} — finishing target dwell first."
       )
@@ -111,6 +243,10 @@ class BotWorkerThread(QThread):
 
   def _graceful_shutdown_timeout_seconds(self) -> float:
     dwell_max = float(getattr(self.config, "dwell_max", 180) or 180)
+    with self._phase_lock:
+      phases = list(self._profile_phases.values())
+    if phases and all(phase != UiStatusKey.VISITING_SITE.value for phase in phases):
+      return max(45.0, dwell_max * 0.1)
     return max(120.0, dwell_max + 45.0)
 
   def _wait_for_graceful_shutdown(self) -> None:
@@ -134,6 +270,19 @@ class BotWorkerThread(QThread):
             self._emit_log(
               f"[Worker] Profile {profile_id} left dwell — stopping now."
             )
+      with self._phase_lock:
+        active_ids = list(self._profile_stop_events.keys())
+      for profile_id in active_ids:
+        with self._phase_lock:
+          phase = self._profile_phases.get(profile_id, "")
+        if phase != UiStatusKey.VISITING_SITE.value:
+          continue
+        started = self._visit_site_started_at.get(profile_id, 0.0)
+        if started > 0 and time.time() >= started + self._dwell_force_stop_seconds():
+          self._force_profile_stop_now(
+            profile_id,
+            reason="Dwell budget exceeded (shutdown waiter)",
+          )
       with self._phase_lock:
         active_ids = list(self._profile_stop_events.keys())
       if not active_ids:
@@ -350,6 +499,7 @@ class BotWorkerThread(QThread):
     return False
 
   def _emit_log(self, message: str) -> None:
+    append_session_log(message)
     self.log.emit(message)
 
   def _emit_profile_update(
@@ -437,21 +587,35 @@ class BotWorkerThread(QThread):
     if not keywords:
       self._emit_log("[Worker] Auto-create mode aborted: no keywords configured.")
       return
+    domains = self.config.get_target_domains()
+    if not domains:
+      self._emit_log("[Worker] Auto-create mode aborted: no target domains configured.")
+      return
     cycles_target = max(1, int(self.config.automation_cycles or 1))
-    keywords_per_cycle = len(keywords)
-    total_keyword_dispatch_target = keywords_per_cycle * cycles_target
-    dispatched_keywords = 0
+    pairs_per_cycle = len(keywords) * len(domains)
+    total_profile_dispatch_target = pairs_per_cycle * cycles_target
+    dispatched_profiles = 0
     self.cycle_progress.emit(0, cycles_target)
     self._emit_log(
       f"[Worker] Auto-create mode enabled (max concurrent: {max_concurrent}, "
-      f"cycles target: {cycles_target}, keywords/cycle: {keywords_per_cycle})"
+      f"cycles target: {cycles_target}, pairs/cycle: {pairs_per_cycle} "
+      f"({len(keywords)} keywords × {len(domains)} sites))"
     )
+
+    if not adspower.wait_until_ready(
+      max_wait_sec=120.0,
+      poll_sec=5.0,
+      stopped=lambda: self._stop_requested,
+    ):
+      self._emit_log("[Worker] Auto-create mode aborted: AdsPower API did not become ready.")
+      return
 
     active_threads: list[threading.Thread] = []
     run_index = 0
     next_create_allowed_at = 0.0
+    create_fail_streak = 0
 
-    while not self._stop_requested and dispatched_keywords < total_keyword_dispatch_target:
+    while not self._stop_requested and dispatched_profiles < total_profile_dispatch_target:
       active_threads = [thread for thread in active_threads if thread.is_alive()]
       if len(active_threads) >= max_concurrent:
         self._interruptible_sleep(0.4)
@@ -470,23 +634,51 @@ class BotWorkerThread(QThread):
         proxy_cursor += 1
 
       run_index += 1
-      profile = self._create_single_profile_for_run(adspower, run_index, chosen_proxy)
-      if not profile:
-        self._interruptible_sleep(2.0)
-        continue
-      remaining_keywords = total_keyword_dispatch_target - dispatched_keywords
-      assigned_keywords = self._assigned_keywords_for_profile(profile, max_keywords=remaining_keywords)
-      if not assigned_keywords:
+      assigned_pair = self._allocate_next_pair()
+      if not assigned_pair[0] or not assigned_pair[1]:
         self._emit_log(
-          f"[Worker] No keywords assigned for {profile.name} "
-          f"({profile.device_label}); deleting profile and trying next slot."
+          "[Worker] No keyword/domain pair available for auto run "
+          f"{run_index}; skipping profile slot."
         )
-        if self._delete_profile_with_retry(adspower, profile.profile_id, reason="no-keywords-assigned"):
-          self.profiles_changed.emit()
         self._interruptible_sleep(1.0)
         continue
-      dispatched_keywords += len(assigned_keywords)
-      completed_cycles = dispatched_keywords // keywords_per_cycle
+
+      forced_os: Optional[str] = None
+      if self._is_mixed_profile_os_mode():
+        keyword, domain = assigned_pair
+        forced_os = self.result_store.resolve_mixed_profile_os(keyword, domain)
+        reason = self.result_store.mixed_profile_os_reason(keyword, domain)
+        self._emit_log(
+          f"[Worker] Mixed OS for '{keyword}' → {domain}: {forced_os} ({reason})"
+        )
+
+      profile = self._create_single_profile_for_run(
+        adspower, run_index, chosen_proxy, forced_os=forced_os,
+      )
+      if not profile:
+        create_fail_streak += 1
+        retry_delay = self._profile_create_retry_delay(
+          create_fail_streak,
+          getattr(self, "_last_profile_create_error", ""),
+          self.config.launch_interval_min,
+        )
+        next_create_allowed_at = time.time() + retry_delay
+        self._emit_log(
+          f"[Worker] Profile create failed ({create_fail_streak}x). "
+          f"Next attempt in {retry_delay:.0f}s."
+        )
+        continue
+      create_fail_streak = 0
+      remaining_slots = total_profile_dispatch_target - dispatched_profiles
+      if remaining_slots <= 0:
+        break
+      profile.assigned_keyword = assigned_pair[0]
+      profile.assigned_domain = assigned_pair[1]
+      self._emit_log(
+        f"[Worker] {profile.name} assigned pair: '{assigned_pair[0]}' → {assigned_pair[1]}"
+      )
+      dispatched_profiles += 1
+      completed_cycles = dispatched_profiles // pairs_per_cycle
       self.cycle_progress.emit(min(completed_cycles, cycles_target), cycles_target)
       self.profiles_changed.emit()
       self.profile_created.emit(profile)
@@ -498,7 +690,7 @@ class BotWorkerThread(QThread):
 
       worker_thread = threading.Thread(
         target=self._run_single_profile,
-        args=(profile, profile.proxy_host, None, assigned_keywords),
+        args=(profile, profile.proxy_host, None, assigned_pair),
         daemon=True,
       )
       worker_thread.start()
@@ -508,15 +700,15 @@ class BotWorkerThread(QThread):
       next_create_allowed_at = time.time() + delay
       self._emit_log(
         f"[Worker] Active profiles: {len(active_threads)}/{max_concurrent}. "
-        f"Keyword progress: {dispatched_keywords}/{total_keyword_dispatch_target} "
+        f"Profile progress: {dispatched_profiles}/{total_profile_dispatch_target} "
         f"(cycles done: {completed_cycles}/{cycles_target}). "
         f"Next create in {delay:.1f}s (counted from creation time)."
       )
 
-    if not self._stop_requested and dispatched_keywords >= total_keyword_dispatch_target:
+    if not self._stop_requested and dispatched_profiles >= total_profile_dispatch_target:
       self.cycle_progress.emit(cycles_target, cycles_target)
       self._emit_log(
-        f"[Worker] Keyword cycle target reached: {cycles_target} full cycle(s). "
+        f"[Worker] Pair cycle target reached: {cycles_target} full cycle(s). "
         "No more profiles will be created; waiting active runs to finish."
       )
 
@@ -529,18 +721,18 @@ class BotWorkerThread(QThread):
     if not self._stop_requested:
       completed_cycles = min(
         cycles_target,
-        (dispatched_keywords + keywords_per_cycle - 1) // keywords_per_cycle,
+        (dispatched_profiles + pairs_per_cycle - 1) // pairs_per_cycle,
       )
       self.cycle_progress.emit(completed_cycles, cycles_target)
-      if dispatched_keywords >= total_keyword_dispatch_target:
+      if dispatched_profiles >= total_profile_dispatch_target:
         self._emit_log(
-          f"[Worker] Keyword cycle target reached: {cycles_target} full cycle(s). "
+          f"[Worker] Pair cycle target reached: {cycles_target} full cycle(s). "
           "All assigned profiles finished."
         )
       else:
         self._emit_log(
-          f"[Worker] Automation dispatch finished: {dispatched_keywords}/{total_keyword_dispatch_target} "
-          f"keyword slots ({completed_cycles}/{cycles_target} cycle(s))."
+          f"[Worker] Automation dispatch finished: {dispatched_profiles}/{total_profile_dispatch_target} "
+          f"profile slots ({completed_cycles}/{cycles_target} cycle(s))."
         )
 
   def _create_single_profile_for_run(
@@ -548,17 +740,21 @@ class BotWorkerThread(QThread):
     adspower: AdsPowerManager,
     run_number: int,
     proxy: Optional[tuple[str, int, str, str]],
+    *,
+    forced_os: Optional[str] = None,
   ) -> Optional[ProfileSpec]:
     if self._stop_requested:
       return None
     try:
       proxy_batch = [proxy] if proxy else []
       self._emit_log(f"[Worker] Creating profile for auto run {run_number} via AdsPower API...")
+      forced_os_types = [forced_os] if forced_os else None
       created = adspower.create_profiles_batch(
         proxies=proxy_batch,
         group_id=self.config.adspower_group_id,
         total=1,
         profile_os_mode=self.config.profile_os_mode,
+        forced_os_types=forced_os_types,
       )
       profile = created[0]
       self._created_profile_ids.add(profile.profile_id)
@@ -567,6 +763,7 @@ class BotWorkerThread(QThread):
       self._emit_log(f"[Worker] Created profile for auto run {run_number}: {profile.name} ({profile.profile_id})")
       return profile
     except Exception as exc:
+      self._last_profile_create_error = str(exc)
       self._emit_log(f"[Worker] Failed to create profile for auto run {run_number}: {exc}")
       return None
 
@@ -584,7 +781,7 @@ class BotWorkerThread(QThread):
     profile: ProfileSpec,
     proxy_key: str,
     scheduler: Optional[ProxyScheduler],
-    assigned_keywords: Optional[list[str]] = None,
+    assigned_pair: Optional[tuple[str, str]] = None,
   ) -> None:
     if self._stop_requested:
       if self.config.auto_create_profiles and profile.profile_id not in self._deleted_profile_ids:
@@ -605,11 +802,16 @@ class BotWorkerThread(QThread):
     self._emit_profile_update(profile, ProfileStatus.LAUNCHING)
     display_proxy_key = self._proxy_key_for_profile(profile)
     self._emit_log(f"[Worker] Launching {profile.name} via proxy {display_proxy_key}")
-    if assigned_keywords is None:
-      assigned_keywords = self._assigned_keywords_for_profile(profile)
+    if assigned_pair is None:
+      assigned_pair = self._assign_profile_pair(profile)
+    keyword, domain = assigned_pair
+    if keyword and domain:
+      profile.assigned_keyword = keyword
+      profile.assigned_domain = domain
     outcome = "error"
     max_tunnel_attempts = 2
     profile_stopped = False
+    last_serp_bot: Optional[SerpBot] = None
     for attempt in range(1, max_tunnel_attempts + 1):
       try:
         ws_endpoint = manager.start_profile(profile.profile_id)
@@ -622,13 +824,21 @@ class BotWorkerThread(QThread):
             manager.stop_profile(profile.profile_id)
           profile_stopped = True
 
-        serp_bot = SerpBot(self.config, self._emit_log)
+        def profile_log(msg: str) -> None:
+          self._touch_profile_progress(profile.profile_id)
+          self._emit_log(msg)
+
+        serp_bot = SerpBot(self.config, profile_log)
+        last_serp_bot = serp_bot
+        self._start_session_stall_watchdog(profile, manager, stop_event)
 
         def on_ui_status(status_key: str, display_text: str) -> None:
+          self._touch_profile_progress(profile.profile_id)
           self._on_profile_phase(profile.profile_id, status_key)
           self._emit_ui_status(profile, status_key, display_text)
 
         def on_failure(failed_profile: ProfileSpec, context: str, exc: BaseException) -> None:
+          self._touch_profile_progress(profile.profile_id)
           self._emit_profile_update(
             failed_profile,
             ProfileStatus.ERROR,
@@ -637,22 +847,32 @@ class BotWorkerThread(QThread):
           if self._failure_callback:
             self._failure_callback(failed_profile.profile_id)
 
-        outcome = serp_bot.run_session(
-          ws_endpoint,
-          profile,
-          stop_event=stop_event,
-          keywords_override=assigned_keywords,
-          on_ui_status=on_ui_status,
-          on_traffic=lambda total, delta: self.traffic_update.emit(
-            profile.profile_id,
-            display_proxy_key,
-            int(delta),
-          ),
-          on_failure=on_failure,
-          on_keyword_exhausted=lambda kw: self._on_keyword_exhausted(profile, kw),
-          on_target_click=self.target_click_logged.emit,
-          on_session_cleanup=stop_profile_once,
-        )
+        try:
+          outcome = serp_bot.run_session(
+            ws_endpoint,
+            profile,
+            stop_event=stop_event,
+            assigned_keyword=keyword,
+            assigned_domain=domain,
+            on_ui_status=on_ui_status,
+            on_traffic=lambda delta, delta_target, delta_other, wire_delta, wire_target, wire_other: self.traffic_update.emit(
+              profile.profile_id,
+              display_proxy_key,
+              int(delta),
+              int(delta_target),
+              int(delta_other),
+              int(wire_delta),
+              int(wire_target),
+              int(wire_other),
+            ),
+            on_failure=on_failure,
+            on_keyword_exhausted=lambda kw: self._on_keyword_exhausted(profile, kw),
+            on_target_click=self.target_click_logged.emit,
+            on_captcha_stat=self.captcha_stat.emit,
+            on_session_cleanup=stop_profile_once,
+          )
+        finally:
+          self._stop_session_stall_watchdog(profile.profile_id)
       except Exception as exc:
         self._emit_log(f"[Worker] Error on {profile.name}: {exc}")
         self._emit_profile_update(
@@ -683,7 +903,37 @@ class BotWorkerThread(QThread):
       )
       self._interruptible_sleep(wait_seconds)
 
+    if (
+      self.config.skip_exhausted_pairs_in_session
+      and outcome == "not_found"
+      and last_serp_bot is not None
+      and last_serp_bot.last_search_exhaustion_eligible
+      and keyword
+      and domain
+    ):
+      self._mark_session_pair_exhausted(keyword, domain)
+
     if self._should_delete_profile_after_run(outcome) and profile.profile_id not in self._deleted_profile_ids:
+      pre_delete_line = build_pre_delete_log_line(
+        profile.name,
+        outcome,
+        keyword or profile.assigned_keyword or "",
+        domain or profile.assigned_domain or "",
+      )
+      if pre_delete_line:
+        self._emit_log(pre_delete_line)
+      failure_url = outcome_to_failure_url(outcome)
+      if failure_url:
+        log_path = (self.config.session_click_log_path or "").strip()
+        if log_path:
+          log_session_failure(
+            log_path,
+            profile_name=profile.name,
+            device=profile.device_label,
+            keyword=(keyword or profile.assigned_keyword or "").strip(),
+            site=(domain or profile.assigned_domain or "").strip(),
+            failure_url=failure_url,
+          )
       if self._delete_profile_with_retry(manager, profile.profile_id, reason=f"outcome:{outcome}"):
         self._emit_log(f"[Worker] Deleted profile {profile.name} after run ({outcome}); proxy entry kept.")
         self.profiles_changed.emit()
@@ -695,11 +945,12 @@ class BotWorkerThread(QThread):
     if scheduler:
       scheduler.mark_finished(proxy_key)
     self._profile_stop_events.pop(profile.profile_id, None)
+    self._clear_dwell_tracking(profile.profile_id)
     with self._phase_lock:
       self._profile_phases.pop(profile.profile_id, None)
       self._graceful_stop_pending.discard(profile.profile_id)
 
-    if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
+    if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error", "proxy_connect_failed"):
       self._emit_profile_update(
         profile,
         ProfileStatus.ERROR,
@@ -707,7 +958,7 @@ class BotWorkerThread(QThread):
       )
     elif outcome == "stopped":
       self._emit_profile_update(profile, ProfileStatus.IDLE)
-    elif outcome not in ("success", "not_found"):
+    elif outcome not in ("success", "not_found", "failed"):
       self._emit_profile_update(profile, ProfileStatus.IDLE)
 
     self._emit_profile_update(
@@ -727,40 +978,59 @@ class BotWorkerThread(QThread):
       time.sleep(0.25)
 
   def _should_delete_profile_after_run(self, outcome: str) -> bool:
-    if outcome in ("success", "not_found", "error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
+    if outcome in ("success", "not_found", "failed", "error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error", "proxy_connect_failed"):
       return True
     if outcome == "stopped" and self.config.auto_create_profiles:
       return True
     return False
 
-  def _assigned_keywords_for_profile(self, profile: ProfileSpec, max_keywords: Optional[int] = None) -> list[str]:
+  def _is_mixed_profile_os_mode(self) -> bool:
+    mode = (self.config.profile_os_mode or "mixed").strip().lower()
+    return mode in ("mixed", "")
+
+  def _allocate_next_pair(self) -> tuple[str, str]:
     keywords = [keyword.strip() for keyword in (self.config.keywords or []) if keyword and keyword.strip()]
-    if not keywords:
-      return []
-
-    max_per_profile = max(1, int(self.config.max_keywords_per_profile or len(keywords)))
-    if max_keywords is not None:
-      max_per_profile = min(max_per_profile, max(0, int(max_keywords)))
-    if max_per_profile <= 0:
-      return []
-
-    assigned = self.keyword_rotation.allocate(
-      target_domain=self.config.primary_target_domain,
-      target_domains=self.config.get_target_domains(),
-      keywords=keywords,
-      batch_size=max_per_profile,
+    domains = self.config.get_target_domains()
+    if not keywords or not domains:
+      return ("", "")
+    skip_pairs = (
+      self._session_exhausted_pairs
+      if self.config.skip_exhausted_pairs_in_session
+      else None
     )
+    keyword, domain = self.pair_rotation.allocate_pair(
+      keywords,
+      domains,
+      skip_pairs=skip_pairs,
+    )
+    if not keyword or not domain:
+      if skip_pairs:
+        self._emit_log(
+          "[Worker] No keyword/domain pair available: all pairs session-skipped "
+          "after full SERP scans with no target."
+        )
+    return keyword, domain
+
+  def _assign_profile_pair(self, profile: ProfileSpec) -> tuple[str, str]:
+    keywords = [keyword.strip() for keyword in (self.config.keywords or []) if keyword and keyword.strip()]
+    domains = self.config.get_target_domains()
+    if not keywords or not domains:
+      return ("", "")
+
+    if (profile.assigned_keyword or "").strip() and (profile.assigned_domain or "").strip():
+      return profile.assigned_keyword.strip(), profile.assigned_domain.strip()
+
+    keyword, domain = self._allocate_next_pair()
     self._emit_log(
-      f"[Worker] {profile.name} keyword batch ({len(assigned)}): "
-      + ", ".join(assigned[:3])
-      + (" ..." if len(assigned) > 3 else "")
+      f"[Worker] {profile.name} assigned pair: '{keyword}' → {domain}"
     )
-    return assigned
+    return keyword, domain
 
   def _on_keyword_exhausted(self, profile: ProfileSpec, keyword: str) -> None:
+    domain = (profile.assigned_domain or "").strip()
     self._emit_log(
-      f"[Worker] {profile.name} checked all available SERP pages for '{keyword}' "
-      "without finding the target. Keyword is kept in the list for future runs."
+      f"[Worker] {profile.name} checked all configured SERP pages for "
+      f"'{keyword}' → {domain or 'target'} without finding the target."
     )
 
   @staticmethod
@@ -777,8 +1047,8 @@ class BotWorkerThread(QThread):
 class ProfileController(QObject):
   log = pyqtSignal(str)
   profile_update = pyqtSignal(str, str, str)
-  proxy_traffic_update = pyqtSignal(str, int)
-  profile_traffic_update = pyqtSignal(str, int, int)
+  proxy_traffic_update = pyqtSignal(str, "qint64")
+  profile_traffic_update = pyqtSignal(str, "qint64", "qint64", "qint64", "qint64")
   cycle_progress_update = pyqtSignal(int, int)
   keyword_excluded = pyqtSignal(str)
   profiles_sync_requested = pyqtSignal()
@@ -787,6 +1057,7 @@ class ProfileController(QObject):
   global_finished = pyqtSignal()
   profile_finished = pyqtSignal(str, str)
   target_click_logged = pyqtSignal()
+  captcha_stat = pyqtSignal(str)
 
   def __init__(self, parent=None):
     super().__init__(parent)
@@ -801,25 +1072,17 @@ class ProfileController(QObject):
     self._captcha_started_at: Dict[str, float] = {}
     self._error_started_at: Dict[str, float] = {}
     self._status: Dict[str, ProfileStatus] = {}
-    self._self_healer = None
-    self._auto_healing_enabled = False
     self._keyword_rotation = KeywordRotationStore()
     self._keyword_exclusion = KeywordExclusionStore()
+    self._pair_rotation = PairRotationStore()
     self._proxy_traffic_totals: Dict[str, int] = {}
     self._profile_traffic_totals: Dict[str, int] = {}
     self._session_traffic_total: int = 0
-
-  def attach_self_healer(self, healer) -> None:
-    self._self_healer = healer
+    self._session_target_traffic: int = 0
+    self._session_other_traffic: int = 0
 
   def clear_keyword_exclusions(self, target_domain: str) -> int:
     return self._keyword_exclusion.clear_domain(target_domain)
-
-  def _handle_automation_failure(self, profile_id: str) -> None:
-    key, text = ProfileStatus.ERROR.to_ui()
-    self.profile_update.emit(profile_id, key, text)
-    if self._auto_healing_enabled and self._self_healer and self._config:
-      self._self_healer.trigger_healing(profile_id, self._config)
 
   def set_profiles(self, profiles: List[ProfileSpec], cooldown_seconds: int = 1800) -> None:
     self._profiles = {p.profile_id: p for p in profiles}
@@ -839,7 +1102,7 @@ class ProfileController(QObject):
       profiles,
       keyword_rotation=self._keyword_rotation,
       keyword_exclusion=self._keyword_exclusion,
-      failure_callback=self._handle_automation_failure,
+      pair_rotation=self._pair_rotation,
     )
     self._global_worker.log.connect(self.log.emit)
     self._global_worker.profile_update.connect(self._on_profile_update)
@@ -851,19 +1114,22 @@ class ProfileController(QObject):
     self._global_worker.profile_deleted.connect(self.profile_deleted.emit)
     self._global_worker.profile_finished.connect(self.profile_finished.emit)
     self._global_worker.target_click_logged.connect(self.target_click_logged.emit)
-    self._global_worker.error.connect(lambda msg: self.log.emit(f"[Worker] {msg}"))
+    self._global_worker.captcha_stat.connect(self.captcha_stat.emit)
+    self._global_worker.error.connect(lambda msg: self._emit_log(f"[Worker] {msg}"))
     self._global_worker.finished_ok.connect(self.global_finished.emit)
     self._global_worker.start()
-    self.log.emit("[Controller] Global automated bot started")
+    self._emit_log("[Controller] Global automated bot started")
     return True
 
   def stop_global(self) -> None:
     if self._global_worker and self._global_worker.isRunning():
       self._global_worker.request_stop()
-      self.log.emit("[Controller] Global bot stop requested")
+      self._emit_log("[Controller] Global bot stop requested")
 
   def reset_session_traffic(self) -> None:
     self._session_traffic_total = 0
+    self._session_target_traffic = 0
+    self._session_other_traffic = 0
     self._profile_traffic_totals.clear()
     self._proxy_traffic_totals.clear()
 
@@ -873,17 +1139,17 @@ class ProfileController(QObject):
   def start_profile_manual(self, profile_id: str, config: BotConfig) -> bool:
     profile = self._profiles.get(profile_id)
     if not profile:
-      self.log.emit(f"[Controller] Unknown profile {profile_id}")
+      self._emit_log(f"[Controller] Unknown profile {profile_id}")
       return False
 
     if profile_id in self._profile_workers and self._profile_workers[profile_id].isRunning():
-      self.log.emit(f"[Controller] {profile.name} is already running")
+      self._emit_log(f"[Controller] {profile.name} is already running")
       return False
 
     proxy_key = profile.proxy_host
     if not self._scheduler.can_run(proxy_key):
       remaining = int(self._scheduler.seconds_until_proxy(proxy_key))
-      self.log.emit(f"[Controller] Proxy {proxy_key} busy/cooling ({remaining}s left)")
+      self._emit_log(f"[Controller] Proxy {proxy_key} busy/cooling ({remaining}s left)")
       key, text = ProfileStatus.COOLDOWN.to_ui(remaining)
       self.profile_update.emit(profile_id, key, text)
       return False
@@ -897,9 +1163,8 @@ class ProfileController(QObject):
       config,
       profile,
       stop_event,
-      keyword_rotation=self._keyword_rotation,
       keyword_exclusion=self._keyword_exclusion,
-      failure_callback=self._handle_automation_failure,
+      pair_rotation=self._pair_rotation,
     )
     worker.log.connect(self.log.emit)
     worker.profile_update.connect(self._on_profile_update)
@@ -909,11 +1174,12 @@ class ProfileController(QObject):
     worker.profile_deleted.connect(self.profile_deleted.emit)
     worker.finished_profile.connect(self._on_profile_finished)
     worker.target_click_logged.connect(self.target_click_logged.emit)
+    worker.captcha_stat.connect(self.captcha_stat.emit)
     self._profile_workers[profile_id] = worker
     key, text = ProfileStatus.LAUNCHING.to_ui()
     self.profile_update.emit(profile_id, key, text)
     worker.start()
-    self.log.emit(f"[Controller] Manual start: {profile.name}")
+    self._emit_log(f"[Controller] Manual start: {profile.name}")
     return True
 
   def pause_profile(self, profile_id: str) -> None:
@@ -923,17 +1189,17 @@ class ProfileController(QObject):
     stop_event = self._stop_events.get(profile_id)
     if stop_event:
       stop_event.set()
-      self.log.emit(f"[Controller] Graceful stop requested for {profile_name}")
+      self._emit_log(f"[Controller] Graceful stop requested for {profile_name}")
       return
 
     if self._global_worker and self._global_worker.isRunning():
       if self._global_worker.request_profile_pause(profile_id):
-        self.log.emit(f"[Controller] Graceful stop requested for {profile_name} (automation)")
+        self._emit_log(f"[Controller] Graceful stop requested for {profile_name} (automation)")
       else:
-        self.log.emit(f"[Controller] {profile_name} is not running")
+        self._emit_log(f"[Controller] {profile_name} is not running")
       return
 
-    self.log.emit(f"[Controller] {profile_name} is not running")
+    self._emit_log(f"[Controller] {profile_name} is not running")
 
   def force_terminate(self, profile_id: str, config: BotConfig) -> None:
     profile = self._profiles.get(profile_id)
@@ -950,9 +1216,10 @@ class ProfileController(QObject):
     self._clear_session_elapsed(profile_id)
     key, text = ProfileStatus.IDLE.to_ui()
     self.profile_update.emit(profile_id, key, text)
-    self.log.emit(f"[Controller] Force terminated {profile_name}")
+    self._emit_log(f"[Controller] Force terminated {profile_name}")
 
   def _emit_log(self, message: str) -> None:
+    append_session_log(message)
     self.log.emit(message)
 
   def _on_profile_update(self, profile_id: str, status_key: str, display_text: str) -> None:
@@ -968,16 +1235,37 @@ class ProfileController(QObject):
     self._track_session_elapsed(profile_id, status_key, display_text)
     self.profile_update.emit(profile_id, status_key, display_text)
 
-  def _on_traffic_update(self, profile_id: str, proxy_key: str, delta_bytes: int) -> None:
-    if delta_bytes <= 0:
+  def _on_traffic_update(
+    self,
+    profile_id: str,
+    proxy_key: str,
+    delta_allowed: int,
+    delta_target_allowed: int = 0,
+    delta_other_allowed: int = 0,
+    delta_wire: int = 0,
+    delta_wire_target: int = 0,
+    delta_wire_other: int = 0,
+  ) -> None:
+    _ = delta_allowed
+    _ = delta_target_allowed
+    _ = delta_other_allowed
+    if delta_wire <= 0:
       return
-    profile_total = self._profile_traffic_totals.get(profile_id, 0) + int(delta_bytes)
+    profile_total = self._profile_traffic_totals.get(profile_id, 0) + int(delta_wire)
     self._profile_traffic_totals[profile_id] = profile_total
-    total = self._proxy_traffic_totals.get(proxy_key, 0) + int(delta_bytes)
+    total = self._proxy_traffic_totals.get(proxy_key, 0) + int(delta_wire)
     self._proxy_traffic_totals[proxy_key] = total
-    self._session_traffic_total += int(delta_bytes)
+    self._session_traffic_total += int(delta_wire)
+    self._session_target_traffic += int(delta_wire_target)
+    self._session_other_traffic += int(delta_wire_other)
     self.proxy_traffic_update.emit(proxy_key, total)
-    self.profile_traffic_update.emit(profile_id, profile_total, self._session_traffic_total)
+    self.profile_traffic_update.emit(
+      profile_id,
+      profile_total,
+      self._session_traffic_total,
+      self._session_target_traffic,
+      self._session_other_traffic,
+    )
 
   def _map_status_key(self, profile_id: str, status_key: str) -> None:
     mapping = {
@@ -990,7 +1278,6 @@ class ProfileController(QObject):
       UiStatusKey.CAPTCHA.value: ProfileStatus.CAPTCHA_WAIT,
       UiStatusKey.CAPTCHA_MANUAL.value: ProfileStatus.CAPTCHA_MANUAL,
       UiStatusKey.ERROR.value: ProfileStatus.ERROR,
-      UiStatusKey.SELF_HEALING.value: ProfileStatus.SELF_HEALING,
       UiStatusKey.CLOSED.value: ProfileStatus.IDLE,
     }
     self._status[profile_id] = mapping.get(status_key, ProfileStatus.IDLE)
@@ -1003,7 +1290,7 @@ class ProfileController(QObject):
     self._profile_workers.pop(profile_id, None)
     self._clear_session_elapsed(profile_id)
 
-    if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error"):
+    if outcome in ("error", "blocked", "ip_changed", "ip_unavailable", "tunnel_error", "proxy_connect_failed"):
       key, text = ProfileStatus.ERROR.to_ui(detail=outcome.replace("_", " "))
       self.profile_update.emit(profile_id, key, text)
     elif outcome != "success":
@@ -1015,7 +1302,7 @@ class ProfileController(QObject):
     key, text = ProfileStatus.COOLDOWN.to_ui(cooldown)
     self.profile_update.emit(profile_id, key, text)
     profile_name = profile.name if profile else profile_id
-    self.log.emit(f"[Controller] {profile_name} finished ({outcome}), proxy cooldown started")
+    self._emit_log(f"[Controller] {profile_name} finished ({outcome}), proxy cooldown started")
     self.profile_finished.emit(profile_id, outcome)
 
   def get_session_elapsed(self, profile_id: str) -> int:
@@ -1078,7 +1365,7 @@ class ProfileController(QObject):
       self._error_started_at.pop(profile_id, None)
       self._profile_traffic_totals.pop(profile_id, None)
     if profile_ids:
-      self.log.emit(f"[Controller] Removed {len(profile_ids)} profile(s) from local state")
+      self._emit_log(f"[Controller] Removed {len(profile_ids)} profile(s) from local state")
 
   def get_status(self, profile_id: str) -> ProfileStatus:
     return self._status.get(profile_id, ProfileStatus.IDLE)

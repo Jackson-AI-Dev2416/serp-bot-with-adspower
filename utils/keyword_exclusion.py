@@ -3,13 +3,15 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from utils.app_paths import data_dir
+
 
 KEYWORD_EXCLUSION_ENABLED = False
 
 
 class KeywordExclusionStore:
-  def __init__(self, path: str | Path = "data/keyword_excluded.json"):
-    self.path = Path(path)
+  def __init__(self, path: str | Path | None = None):
+    self.path = Path(path) if path is not None else data_dir() / "keyword_excluded.json"
     self._lock = threading.Lock()
 
   def is_excluded(self, target_domain: str, keyword: str) -> bool:

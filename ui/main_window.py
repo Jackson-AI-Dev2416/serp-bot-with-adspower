@@ -1,11 +1,10 @@
-from html import escape
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QKeyEvent, QPalette, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QGuiApplication, QPalette
 from PyQt6.QtWidgets import (
   QCheckBox,
   QComboBox,
@@ -24,6 +23,7 @@ from PyQt6.QtWidgets import (
   QPlainTextEdit,
   QPushButton,
   QButtonGroup,
+  QSizePolicy,
   QSpinBox,
   QTabWidget,
   QTableWidget,
@@ -32,7 +32,17 @@ from PyQt6.QtWidgets import (
   QVBoxLayout,
   QWidget,
 )
-
+from ui.cards import make_kpi_card
+from ui.settings_widgets import (
+  PasswordField,
+  SETTINGS_COMBO_OS_WIDTH,
+  ToggleSwitch,
+  apply_spinbox_width,
+  make_labeled_field_row,
+  make_labeled_toggle_stack,
+  make_range_row,
+  make_settings_card,
+)
 from config.bot_config import BotConfig
 from config.settings_store import load_settings, save_settings
 from core.profile_status import (
@@ -44,39 +54,97 @@ from core.profile_status import (
 )
 from core.worker import ProfileController
 from services.adspower_manager import AdsPowerManager, ProfileSpec
-from utils.cursor_agent_client import CURSOR_SDK_AVAILABLE, CursorChatController
-from utils.cursor_models import CURSOR_MODEL_CHOICES, DEFAULT_CURSOR_MODEL, normalize_cursor_model
+from utils.app_paths import app_base_dir, data_dir
 from utils.csv_logger import (
   SessionClickCsvLogger,
   aggregate_keyword_clicks,
   aggregate_keyword_clicks_for_domain,
-  count_target_not_found_in_session,
+  count_session_click_outcomes,
   filter_click_rows_by_domain,
   format_result_session_label,
   list_session_result_files,
   new_session_click_log_path,
   read_session_click_file,
-  session_result_window,
   session_target_domains,
+  should_auto_stop_on_failure_rate,
 )
-from utils.self_healer import SelfHealer
 
 PROFILE_ID_ROLE = Qt.ItemDataRole.UserRole
 
+def _load_theme_stylesheet() -> str:
+  path = Path(__file__).resolve().parent / "theme.qss"
+  try:
+    return path.read_text(encoding="utf-8")
+  except OSError:
+    return ""
+
+
 STYLESHEET = """
 QMainWindow {
-  background-color: #080a0f;
+  background-color: #080B14;
 }
 QWidget {
   background-color: transparent;
-  color: #e2e8f0;
+  color: #F8FAFC;
   font-family: "Segoe UI", "Inter", sans-serif;
   font-size: 13px;
 }
+QWidget#contentArea {
+  background-color: #080B14;
+}
+QFrame#appSidebar {
+  background-color: #111827;
+  border-right: 1px solid #263044;
+}
+QLabel#sidebarLogo {
+  font-size: 20px;
+  font-weight: 800;
+  color: #F8FAFC;
+  letter-spacing: -0.4px;
+  line-height: 1.2;
+}
+QLabel#sidebarSubtitle {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: -2px;
+}
+QPushButton#sidebarNavBtn {
+  background: transparent;
+  color: #94A3B8;
+  text-align: left;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-weight: 600;
+  min-height: 36px;
+}
+QPushButton#sidebarNavBtn:hover {
+  background-color: #151B2B;
+  color: #E2E8F0;
+}
+QPushButton#sidebarNavBtn:checked {
+  background-color: #7C3AED;
+  color: #F8FAFC;
+}
+QFrame#kpiCard {
+  background-color: #151B2B;
+  border: 1px solid #263044;
+  border-radius: 12px;
+}
+QLabel#kpiTitle {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94A3B8;
+  letter-spacing: 0.6px;
+}
+QLabel#kpiValue {
+  font-size: 26px;
+  font-weight: 700;
+  color: #F8FAFC;
+}
 QFrame#panelCard {
-  background-color: #11141c;
-  border: 1px solid #1e2430;
-  border-radius: 14px;
+  background-color: #151B2B;
+  border: 1px solid #263044;
+  border-radius: 12px;
 }
 QLabel#appTitle {
   font-size: 24px;
@@ -152,6 +220,174 @@ QGroupBox::title {
   padding: 0 8px;
   color: #94a3b8;
 }
+QGroupBox#settingsGroup {
+  margin-top: 8px;
+  padding: 10px 12px 10px 12px;
+}
+QFrame#settingsCard {
+  background-color: rgba(30, 30, 45, 0.92);
+  border: 1px solid #2b2b40;
+  border-radius: 14px;
+}
+QLabel#settingsCardTitle {
+  font-size: 15px;
+  font-weight: 700;
+  color: #f1f5f9;
+  letter-spacing: -0.2px;
+}
+QLabel#settingsCardSubtitle {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 5px;
+  padding-top: 2px;
+}
+QLabel#settingsFormLabel,
+QLabel#settingsRangeLabel {
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 500;
+}
+QLabel#settingsRangeCaption {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+}
+QLabel#settingsRangeSep {
+  color: #6366f1;
+  font-size: 14px;
+  font-weight: 700;
+}
+QLabel#settingsRangeUnit {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 600;
+  min-width: 28px;
+}
+QWidget#passwordFieldWrap {
+  background-color: #12121f;
+  border: 1px solid #2b2b40;
+  border-radius: 8px;
+}
+QWidget#passwordFieldWrap:focus-within {
+  border: 2px solid #818cf8;
+  background-color: #141428;
+}
+QPushButton#btnPasswordToggle {
+  background: transparent;
+  color: #94a3b8;
+  border: none;
+  border-left: 1px solid #2b2b40;
+  border-radius: 0 8px 8px 0;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+QPushButton#btnPasswordToggle:hover {
+  color: #e2e8f0;
+  background-color: #1e1e2d;
+}
+QPushButton#btnPasswordToggle:checked {
+  color: #c4b5fd;
+}
+QCheckBox#settingsToggle {
+  spacing: 10px;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 500;
+}
+QCheckBox#settingsToggle::indicator {
+  width: 46px;
+  height: 24px;
+  border-radius: 12px;
+  border: 1px solid #3f3f5a;
+  background: #252538;
+}
+QCheckBox#settingsToggle::indicator:hover {
+  border-color: #6366f1;
+}
+QCheckBox#settingsToggle::indicator:checked {
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #6366f1, stop:1 #a855f7);
+  border: 1px solid #a78bfa;
+}
+QFrame#settingsFooter {
+  background-color: rgba(13, 16, 23, 0.85);
+  border-top: 1px solid #2b2b40;
+  border-radius: 0 0 12px 12px;
+  padding: 12px 20px;
+  margin-top: 4px;
+}
+QGroupBox#settingsGroup::title {
+  left: 10px;
+}
+QLineEdit#settingsApiField,
+QComboBox#settingsComboField,
+QSpinBox#settingsField,
+QDoubleSpinBox#settingsField {
+  min-height: 34px;
+  max-height: 34px;
+}
+QLineEdit#settingsApiField {
+  background-color: #12121f;
+  border: 1px solid #2b2b40;
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+QLineEdit#settingsApiField:focus {
+  border: 2px solid #818cf8;
+  background-color: #141428;
+}
+QWidget#passwordFieldWrap QLineEdit#settingsApiField {
+  background: transparent;
+  border: none;
+}
+QWidget#passwordFieldWrap QLineEdit#settingsApiField:focus {
+  background: transparent;
+  border: none;
+}
+QSpinBox#settingsField,
+QDoubleSpinBox#settingsField,
+QComboBox#settingsComboField {
+  background-color: #12121f;
+  color: #e2e8f0;
+  border: 1px solid #2b2b40;
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+QSpinBox#settingsField:focus,
+QDoubleSpinBox#settingsField:focus,
+QComboBox#settingsComboField:focus,
+QComboBox#settingsComboField:on {
+  border: 2px solid #818cf8;
+  background-color: #141428;
+}
+QComboBox#settingsComboField {
+  padding-right: 30px;
+}
+QComboBox#settingsComboField::drop-down {
+  subcontrol-origin: padding;
+  subcontrol-position: top right;
+  width: 28px;
+  border: none;
+  border-top-right-radius: 8px;
+  border-bottom-right-radius: 8px;
+  background: #141925;
+}
+QComboBox#settingsComboField::down-arrow {
+  width: 10px;
+  height: 10px;
+  image: none;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 6px solid #94a3b8;
+  margin-right: 8px;
+}
+QComboBox#settingsComboField QAbstractItemView {
+  background-color: #0d1017;
+  color: #e2e8f0;
+  border: 1px solid #252b38;
+  selection-background-color: #6366f1;
+  outline: none;
+}
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox {
   background-color: #0a0d14;
   color: #e2e8f0;
@@ -168,8 +404,13 @@ QPlainTextEdit#settingsMultilineEdit, QTextEdit#settingsMultilineEdit {
 QPlainTextEdit#settingsMultilineEdit {
   padding: 8px 10px;
 }
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-  border: 1px solid #6366f1;
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {
+  border: 2px solid #818cf8;
+  background-color: #141428;
+}
+QSpinBox:focus, QDoubleSpinBox:focus {
+  border: 2px solid #818cf8;
+  background-color: #141428;
 }
 QSpinBox::up-button, QSpinBox::down-button,
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
@@ -290,12 +531,24 @@ QPushButton {
   font-weight: 600;
   font-size: 12px;
 }
+QPushButton#btnCreate,
+QPushButton#btnStartAuto,
+QPushButton#btnStopAuto,
+QPushButton#btnRefresh,
+QPushButton#btnBulkStart,
+QPushButton#btnBulkPause,
+QPushButton#btnBulkKill,
+QPushButton#btnBulkDelete {
+  min-height: 36px;
+  max-height: 36px;
+  padding: 0 16px;
+}
 QPushButton#btnCreate {
-  background-color: #4f46e5;
+  background-color: #7C3AED;
   color: #ffffff;
 }
-QPushButton#btnCreate:hover { background-color: #6366f1; }
-QPushButton#btnCreate:pressed { background-color: #4338ca; }
+QPushButton#btnCreate:hover { background-color: #8B5CF6; }
+QPushButton#btnCreate:pressed { background-color: #6D28D9; }
 QPushButton#btnRefresh {
   background-color: #1e2430;
   color: #cbd5e1;
@@ -352,69 +605,25 @@ QPushButton#btnStopAuto {
 QPushButton#btnStopAuto:hover { background-color: #ef4444; }
 QPushButton#btnStopAuto:pressed { background-color: #b91c1c; }
 QPushButton#btnSaveSettings {
-  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6);
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #6366f1, stop:1 #a855f7);
   color: #ffffff;
-  min-width: 180px;
-  padding: 12px 24px;
-  font-size: 13px;
+  min-width: 200px;
+  min-height: 42px;
+  padding: 12px 28px;
+  font-size: 14px;
+  font-weight: 700;
   border: 1px solid #7c3aed;
+  border-radius: 10px;
 }
 QPushButton#btnSaveSettings:hover {
-  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #818cf8, stop:1 #a78bfa);
-  border-color: #a5b4fc;
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #818cf8, stop:1 #c084fc);
+  border-color: #c4b5fd;
+  padding: 13px 30px;
 }
 QPushButton#btnSaveSettings:pressed {
-  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #6d28d9);
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #4f46e5, stop:1 #7e22ce);
   border-color: #5b21b6;
-}
-QPushButton#btnSendManualFix {
-  background-color: #4f46e5;
-  color: #ffffff;
-  min-width: 140px;
-  border: 1px solid #6366f1;
-}
-QPushButton#btnSendManualFix:hover {
-  background-color: #6366f1;
-  border-color: #a5b4fc;
-}
-QPushButton#btnSendManualFix:pressed { background-color: #4338ca; }
-QPushButton#btnSendManualFix:disabled {
-  background-color: #1a1f2b;
-  color: #475569;
-  border: 1px solid #1e2430;
-}
-QPushButton#btnSendAiFix {
-  background-color: #4f46e5;
-  color: #ffffff;
-  min-width: 120px;
-  border: 1px solid #6366f1;
-}
-QPushButton#btnSendAiFix:hover {
-  background-color: #6366f1;
-  border-color: #a5b4fc;
-}
-QPushButton#btnSendAiFix:pressed { background-color: #4338ca; }
-QPushButton#btnSendAiFix:disabled {
-  background-color: #1a1f2b;
-  color: #475569;
-  border: 1px solid #1e2430;
-}
-QTextEdit#aiFixChat {
-  background-color: #06080c;
-  color: #cbd5e1;
-  border: 1px solid #1e2430;
-  border-radius: 12px;
-  padding: 12px;
-  font-family: "Segoe UI", "Inter", sans-serif;
-  font-size: 13px;
-  selection-background-color: #312e81;
-}
-QPlainTextEdit#aiFixPrompt {
-  background-color: #0a0d14;
-  border: 1px solid #252b38;
-  border-radius: 10px;
-  padding: 10px;
-  font-size: 13px;
+  padding: 11px 26px;
 }
 QPushButton#btnRowStart {
   background-color: #065f46;
@@ -504,15 +713,17 @@ QPushButton:disabled {
   color: #475569;
   border: 1px solid #1e2430;
 }
-QPlainTextEdit#logView {
+QPlainTextEdit#logView, QTextEdit#logView {
   background-color: #06080c;
-  color: #94a3b8;
+  color: #e2e8f0;
   border: 1px solid #1e2430;
   border-radius: 12px;
   padding: 10px;
-  font-family: "Cascadia Code", Consolas, monospace;
-  font-size: 11px;
+  font-family: "Cascadia Code", "Malgun Gothic", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.45;
   selection-background-color: #312e81;
+  selection-color: #ffffff;
 }
 QScrollBar:vertical {
   background: #0d1017;
@@ -538,27 +749,43 @@ STATUS_COLORS = {
   UiStatusKey.CAPTCHA.value: QColor("#fbbf24"),
   UiStatusKey.CAPTCHA_MANUAL.value: QColor("#fbbf24"),
   UiStatusKey.ERROR.value: QColor("#f87171"),
-  UiStatusKey.SELF_HEALING.value: QColor("#c084fc"),
   UiStatusKey.CLOSED.value: QColor("#64748b"),
 }
 
 _TIMER_SUFFIX_RE = re.compile(r" \[\d{2,}:\d{2}\]$")
 
 
-class AiFixPromptEdit(QPlainTextEdit):
-  def __init__(self, on_send, parent=None):
-    super().__init__(parent)
-    self._on_send = on_send
+class SelectAllHeaderView(QHeaderView):
+  """Checkbox embedded in the profile table Select column header."""
 
-  def keyPressEvent(self, event: QKeyEvent) -> None:
-    if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-      if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-        super().keyPressEvent(event)
-        return
-      event.accept()
-      self._on_send()
+  def __init__(self, parent=None) -> None:
+    super().__init__(Qt.Orientation.Horizontal, parent)
+    self.chk_select_all = QCheckBox(self)
+    self.chk_select_all.setObjectName("selectAllCheck")
+    self.chk_select_all.setToolTip("Select All")
+    self.sectionResized.connect(self._reposition_checkbox)
+    self.geometriesChanged.connect(self._reposition_checkbox)
+
+  def showEvent(self, event) -> None:
+    super().showEvent(event)
+    self._reposition_checkbox()
+
+  def resizeEvent(self, event) -> None:
+    super().resizeEvent(event)
+    self._reposition_checkbox()
+
+  def _reposition_checkbox(self) -> None:
+    if self.count() < 1:
       return
-    super().keyPressEvent(event)
+    section_x = self.sectionPosition(0)
+    section_w = self.sectionSize(0)
+    checkbox = self.chk_select_all
+    checkbox_w = checkbox.sizeHint().width()
+    checkbox_h = checkbox.sizeHint().height()
+    checkbox.move(
+      section_x + max(0, (section_w - checkbox_w) // 2),
+      max(0, (self.height() - checkbox_h) // 2),
+    )
 
 
 class UiMainWindow(QMainWindow):
@@ -588,28 +815,26 @@ class UiMainWindow(QMainWindow):
 
   def __init__(self):
     super().__init__()
-    self.setWindowTitle("SERP Bot")
-    self.resize(1360, 900)
-    self.setStyleSheet(STYLESHEET)
+    self.setWindowTitle("SERP Automation")
+    theme = _load_theme_stylesheet()
+    self.setStyleSheet(theme or STYLESHEET)
 
     self._profiles: list[ProfileSpec] = []
     self._controller = ProfileController(self)
-    self._project_root = Path(__file__).resolve().parents[1]
-    self._cursor_chat = CursorChatController(self._project_root)
-    self._self_healer = SelfHealer(project_root=self._project_root, parent=self)
-    self._controller.attach_self_healer(self._self_healer)
+    self._project_root = app_base_dir()
+    self._data_dir = data_dir()
     self._status_map: dict[str, tuple[str, str]] = {}
     self._profile_traffic_totals: dict[str, int] = {}
     self._session_traffic_total: int = 0
+    self._session_target_traffic: int = 0
+    self._session_other_traffic: int = 0
     self._overall_clicks_session: int = 0
+    self._session_captcha_auto: int = 0
+    self._session_captcha_total: int = 0
     self._session_click_log_path: str = ""
     self._global_running = False
+    self._failure_rate_auto_stop_triggered = False
     self._syncing_select_all = False
-    self._ai_fix_assistant_open = False
-    self._ai_chat_persist_timer = QTimer(self)
-    self._ai_chat_persist_timer.setSingleShot(True)
-    self._ai_chat_persist_timer.setInterval(500)
-    self._ai_chat_persist_timer.timeout.connect(self._persist_ai_chat_state)
     self._live_profile_refresh_timer = QTimer(self)
     self._live_profile_refresh_timer.setSingleShot(True)
     self._live_profile_refresh_timer.setInterval(500)
@@ -617,8 +842,13 @@ class UiMainWindow(QMainWindow):
     self._pending_live_refresh = False
     self._live_sync_queue_count = 0
     self._live_sync_inflight = False
+    self._elapsed_seconds = 0
+    self._elapsed_timer = QTimer(self)
+    self._elapsed_timer.setInterval(1000)
+    self._elapsed_timer.timeout.connect(self._tick_elapsed_time)
 
     self._build_ui()
+    self._fit_window_to_screen()
     self._load_saved_settings()
     self._wire_signals()
 
@@ -649,12 +879,38 @@ class UiMainWindow(QMainWindow):
 
   def _build_ui(self) -> None:
     self.tabs = QTabWidget()
+    self.tabs.setDocumentMode(True)
     self.setCentralWidget(self.tabs)
     self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
-    self.tabs.addTab(self._build_ai_fix_tab(), "AI Fix")
     self.tabs.addTab(self._build_settings_tab(), "Settings")
     self.tabs.addTab(self._build_result_tab(), "Result")
     self._result_tab_index = self.tabs.count() - 1
+    self.tabs.currentChanged.connect(self._on_main_tab_changed)
+
+  def _current_page_index(self) -> int:
+    return self.tabs.currentIndex()
+
+  def _fit_window_to_screen(self) -> None:
+    """Keep the control panel within the monitor work area (DPI / taskbar safe)."""
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+      self.setMinimumSize(1100, 640)
+      self.resize(1480, 900)
+      return
+
+    available = screen.availableGeometry()
+    min_w = min(1100, max(960, available.width() // 2))
+    min_h = min(640, max(520, available.height() // 2))
+    self.setMinimumSize(min_w, min_h)
+
+    margin = 16
+    target_w = max(min_w, available.width() - margin)
+    target_h = max(min_h, int(available.height() * 0.92))
+    self.resize(target_w, target_h)
+
+    frame = self.frameGeometry()
+    frame.moveCenter(available.center())
+    self.move(frame.topLeft())
 
   @staticmethod
   def _card_panel(inner: QHBoxLayout | QVBoxLayout) -> QFrame:
@@ -668,18 +924,34 @@ class UiMainWindow(QMainWindow):
   def _build_dashboard_tab(self) -> QWidget:
     tab = QWidget()
     layout = QVBoxLayout(tab)
-    layout.setSpacing(14)
+    layout.setSpacing(8)
     layout.setContentsMargins(4, 4, 4, 4)
 
-    header = QVBoxLayout()
-    header.setSpacing(2)
-    title = QLabel("SERP Automation")
-    title.setObjectName("appTitle")
-    subtitle = QLabel("AdsPower  ·  Playwright  ·  CapSolver")
-    subtitle.setObjectName("appSubtitle")
-    header.addWidget(title)
-    header.addWidget(subtitle)
-    layout.addLayout(header)
+    kpi_row = QHBoxLayout()
+    kpi_row.setSpacing(12)
+    elapsed_card, self.elapsed_time_value_label = make_kpi_card(
+      "Elapsed time",
+      tooltip="Automation run duration since Start Automation (MM:SS).",
+    )
+    self.elapsed_time_value_label.setText("00:00")
+    traffic_card, self.proxy_traffic_total_label = make_kpi_card(
+      "Proxy Traffic",
+      tooltip=(
+        "CDP wire estimate (upload+download through proxy tunnel). "
+        "Format: total (site / other). "
+        "Before target open = other; after successful click/touch = site."
+      ),
+    )
+    self.proxy_traffic_total_label.setText("0 B")
+    cycle_card, self.present_cycle_value_label = make_kpi_card("Current Session")
+    self.present_cycle_value_label.setText("0 / 0")
+    clicks_card, self.overall_clicks_value_label = make_kpi_card("Total Clicks")
+    self.overall_clicks_value_label.setText("0 / 0")
+    active_card, self.captcha_occurs_value_label = make_kpi_card("Captcha Occurs")
+    self.captcha_occurs_value_label.setText("0 / 0")
+    for card in (elapsed_card, traffic_card, cycle_card, clicks_card, active_card):
+      kpi_row.addWidget(card, stretch=1)
+    layout.addLayout(kpi_row)
 
     control_bar = QHBoxLayout()
     control_bar.setSpacing(10)
@@ -692,18 +964,6 @@ class UiMainWindow(QMainWindow):
     self.btn_stop_auto = QPushButton("Stop Automation")
     self.btn_stop_auto.setObjectName("btnStopAuto")
     self.btn_stop_auto.setEnabled(False)
-    self.proxy_traffic_title_label = QLabel("Traffic Total")
-    self.proxy_traffic_title_label.setObjectName("trafficTotalTitle")
-    self.proxy_traffic_total_label = QLabel("0 B")
-    self.proxy_traffic_total_label.setObjectName("trafficTotalValue")
-    self.present_cycle_title_label = QLabel("Present Cycle")
-    self.present_cycle_title_label.setObjectName("trafficTotalTitle")
-    self.present_cycle_value_label = QLabel("0 / 0")
-    self.present_cycle_value_label.setObjectName("trafficTotalValue")
-    self.overall_clicks_title_label = QLabel("Overall Clicks")
-    self.overall_clicks_title_label.setObjectName("trafficTotalTitle")
-    self.overall_clicks_value_label = QLabel("0")
-    self.overall_clicks_value_label.setObjectName("trafficTotalValue")
 
     count_label = QLabel("Count")
     count_label.setObjectName("sectionTitle")
@@ -729,37 +989,24 @@ class UiMainWindow(QMainWindow):
     self.cycles_spin.setFixedWidth(80)
     self.cycles_spin.setToolTip("Stop automation after full keyword list cycles this many times")
 
+    self.btn_bulk_start = QPushButton("Start Selected")
+    self.btn_bulk_start.setObjectName("btnBulkStart")
+    self.btn_bulk_pause = QPushButton("Pause Selected")
+    self.btn_bulk_pause.setObjectName("btnBulkPause")
+    self.btn_bulk_kill = QPushButton("Stop Selected")
+    self.btn_bulk_kill.setObjectName("btnBulkKill")
+    self.btn_bulk_delete = QPushButton("Delete Selected")
+    self.btn_bulk_delete.setObjectName("btnBulkDelete")
+
     control_bar.addWidget(count_label)
     control_bar.addWidget(self.profile_count_spin)
     control_bar.addWidget(self.btn_create)
     control_bar.addWidget(self.btn_refresh)
-    control_bar.addStretch()
-    traffic_box = QWidget()
-    traffic_layout = QVBoxLayout(traffic_box)
-    traffic_layout.setContentsMargins(0, 0, 0, 0)
-    traffic_layout.setSpacing(1)
-    traffic_layout.addWidget(self.proxy_traffic_title_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-    traffic_layout.addWidget(self.proxy_traffic_total_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-    cycle_box = QWidget()
-    cycle_layout = QVBoxLayout(cycle_box)
-    cycle_layout.setContentsMargins(0, 0, 0, 0)
-    cycle_layout.setSpacing(1)
-    cycle_layout.addWidget(self.present_cycle_title_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-    cycle_layout.addWidget(self.present_cycle_value_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-    clicks_box = QWidget()
-    clicks_layout = QVBoxLayout(clicks_box)
-    clicks_layout.setContentsMargins(0, 0, 0, 0)
-    clicks_layout.setSpacing(1)
-    clicks_layout.addWidget(self.overall_clicks_title_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-    clicks_layout.addWidget(self.overall_clicks_value_label, alignment=Qt.AlignmentFlag.AlignHCenter)
-    cycle_clicks_box = QWidget()
-    cycle_clicks_layout = QHBoxLayout(cycle_clicks_box)
-    cycle_clicks_layout.setContentsMargins(0, 0, 0, 0)
-    cycle_clicks_layout.setSpacing(18)
-    cycle_clicks_layout.addWidget(cycle_box)
-    cycle_clicks_layout.addWidget(clicks_box)
-    control_bar.addWidget(traffic_box)
-    control_bar.addWidget(cycle_clicks_box)
+    control_bar.addSpacing(30)
+    control_bar.addWidget(self.btn_bulk_start)
+    control_bar.addWidget(self.btn_bulk_pause)
+    control_bar.addWidget(self.btn_bulk_kill)
+    control_bar.addWidget(self.btn_bulk_delete)
     control_bar.addStretch()
     control_bar.addWidget(threads_label)
     control_bar.addWidget(self.threads_spin)
@@ -769,29 +1016,15 @@ class UiMainWindow(QMainWindow):
     control_bar.addWidget(self.btn_stop_auto)
     layout.addWidget(self._card_panel(control_bar))
 
-    bulk_bar = QHBoxLayout()
-    bulk_bar.setSpacing(8)
-    self.chk_select_all = QCheckBox("Select All")
-    self.chk_select_all.setObjectName("selectAllCheck")
-    self.btn_bulk_start = QPushButton("Start Selected")
-    self.btn_bulk_start.setObjectName("btnBulkStart")
-    self.btn_bulk_pause = QPushButton("Pause Selected")
-    self.btn_bulk_pause.setObjectName("btnBulkPause")
-    self.btn_bulk_kill = QPushButton("Stop Selected")
-    self.btn_bulk_kill.setObjectName("btnBulkKill")
-    self.btn_bulk_delete = QPushButton("Delete Selected")
-    self.btn_bulk_delete.setObjectName("btnBulkDelete")
-    bulk_bar.addWidget(self.chk_select_all)
-    bulk_bar.addWidget(self.btn_bulk_start)
-    bulk_bar.addWidget(self.btn_bulk_pause)
-    bulk_bar.addWidget(self.btn_bulk_kill)
-    bulk_bar.addWidget(self.btn_bulk_delete)
-    bulk_bar.addStretch()
-    layout.addWidget(self._card_panel(bulk_bar))
-
     self.profile_table = QTableWidget(0, len(self.COLUMNS))
     self.profile_table.setObjectName("profileTable")
-    self.profile_table.setHorizontalHeaderLabels(self.COLUMNS)
+    select_header = SelectAllHeaderView(self.profile_table)
+    self.profile_table.setHorizontalHeader(select_header)
+    self.chk_select_all = select_header.chk_select_all
+    self.profile_table.setHorizontalHeaderLabels(list(self.COLUMNS))
+    header_item = self.profile_table.horizontalHeaderItem(self.COL_CHECK)
+    if header_item is not None:
+      header_item.setText("")
     self.profile_table.setAlternatingRowColors(True)
     self.profile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -803,25 +1036,28 @@ class UiMainWindow(QMainWindow):
     header.setSectionResizeMode(self.COL_CHECK, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_NO, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_ID, QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Interactive)
     header.setSectionResizeMode(self.COL_OS, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_BROWSER, QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(self.COL_PROXY, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(self.COL_PROXY, QHeaderView.ResizeMode.Interactive)
     header.setSectionResizeMode(self.COL_TRAFFIC, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(self.COL_ACTIONS, QHeaderView.ResizeMode.ResizeToContents)
-    self.profile_table.setColumnWidth(self.COL_STATUS, 150)
+    self.profile_table.setColumnWidth(self.COL_NAME, 80)
+    self.profile_table.setColumnWidth(self.COL_PROXY, 140)
+    self.profile_table.setColumnWidth(self.COL_STATUS, 140)
     self.profile_table.setWordWrap(True)
     self.profile_table.setTextElideMode(Qt.TextElideMode.ElideNone)
     self.profile_table.itemChanged.connect(self._on_profile_table_item_changed)
 
     log_title = QLabel("ACTIVITY LOG")
     log_title.setObjectName("sectionTitle")
-    self.log_view = QPlainTextEdit()
+    self.log_view = QTextEdit()
     self.log_view.setObjectName("logView")
     self.log_view.setReadOnly(True)
-    self.log_view.setMaximumBlockCount(8000)
-    log_font = QFont("Consolas", 9)
+    self.log_view.document().setMaximumBlockCount(8000)
+    log_font = QFont("Malgun Gothic", 11)
+    log_font.setStyleHint(QFont.StyleHint.Monospace)
     self.log_view.setFont(log_font)
 
     left_panel = QWidget()
@@ -831,6 +1067,7 @@ class UiMainWindow(QMainWindow):
     left_layout.addWidget(self.profile_table)
 
     right_panel = QWidget()
+    right_panel.setMinimumWidth(338)
     right_layout = QVBoxLayout(right_panel)
     right_layout.setContentsMargins(0, 0, 0, 0)
     right_layout.setSpacing(6)
@@ -839,225 +1076,350 @@ class UiMainWindow(QMainWindow):
 
     split_row = QHBoxLayout()
     split_row.setSpacing(12)
-    split_row.addWidget(left_panel, stretch=2)
-    split_row.addWidget(right_panel, stretch=1)
+    split_row.addWidget(left_panel, stretch=5)
+    split_row.addWidget(right_panel, stretch=3)
     layout.addLayout(split_row, stretch=1)
     return tab
 
-  def _build_ai_fix_tab(self) -> QWidget:
-    tab = QWidget()
-    layout = QVBoxLayout(tab)
-    layout.setContentsMargins(8, 8, 8, 8)
-    layout.setSpacing(12)
-
-    title = QLabel("AI Fix — Cursor Agent")
-    title.setObjectName("appTitle")
-    layout.addWidget(title)
-
-    subtitle = QLabel(
-      "Chat with Cursor to edit this app (UI, SERP bot, AdsPower, workers). "
-      "Changes apply to project files on disk — restart the app after Python/UI updates."
+  @staticmethod
+  def _configure_settings_line_edit(edit: QLineEdit) -> None:
+    edit.setObjectName("settingsApiField")
+    edit.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Fixed,
     )
-    subtitle.setObjectName("hintLabel")
-    subtitle.setWordWrap(True)
-    layout.addWidget(subtitle)
+    edit.setMinimumWidth(280)
+    edit.setFixedHeight(36)
 
-    if not CURSOR_SDK_AVAILABLE:
-      warn = QLabel("cursor-sdk is not installed. Run: pip install cursor-sdk")
-      warn.setStyleSheet("color: #f87171; font-weight: 600;")
-      warn.setWordWrap(True)
-      layout.addWidget(warn)
-
-    api_group = QGroupBox("Cursor API")
-    api_form = QFormLayout(api_group)
-    self.cursor_api_key = QLineEdit()
-    self.cursor_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-    self.cursor_api_key.setPlaceholderText("cursor_... from Cursor Dashboard → Integrations")
-    self.cursor_model = QComboBox()
-    self.cursor_model.setEditable(True)
-    for model_name in CURSOR_MODEL_CHOICES:
-      self.cursor_model.addItem(model_name)
-    self.cursor_model.setCurrentText(DEFAULT_CURSOR_MODEL)
-    model_hint = QLabel(
-      "Default gpt-5.3-codex uses API quota. composer-* models use First-party (Auto/Composer) quota."
+  @staticmethod
+  def _configure_settings_combo(combo: QComboBox) -> None:
+    combo.setObjectName("settingsComboField")
+    combo.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Fixed,
     )
-    model_hint.setObjectName("hintLabel")
-    model_hint.setWordWrap(True)
-    api_form.addRow("Cursor API Key:", self.cursor_api_key)
-    api_form.addRow("Model:", self.cursor_model)
-    api_form.addRow("", model_hint)
-    layout.addWidget(api_group)
+    combo.setMinimumWidth(120)
+    combo.setFixedHeight(36)
 
-    chat_title = QLabel("CONVERSATION")
-    chat_title.setObjectName("sectionTitle")
-    layout.addWidget(chat_title)
+  @staticmethod
+  def _configure_settings_spinbox(spinbox) -> None:
+    spinbox.setObjectName("settingsField")
+    spinbox.setFixedHeight(36)
+    spinbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    apply_spinbox_width(spinbox)
 
-    self.ai_fix_chat = QTextEdit()
-    self.ai_fix_chat.setObjectName("aiFixChat")
-    self.ai_fix_chat.setReadOnly(True)
-    self.ai_fix_chat.setMinimumHeight(320)
-    ai_chat_font = QFont("Segoe UI", 10)
-    self.ai_fix_chat.setFont(ai_chat_font)
-    layout.addWidget(self.ai_fix_chat, stretch=1)
-
-    self.ai_fix_prompt = AiFixPromptEdit(self.on_send_ai_fix)
-    self.ai_fix_prompt.setObjectName("aiFixPrompt")
-    self.ai_fix_prompt.setPlaceholderText(
-      "Describe what to change, e.g. Remove ... ellipsis on profile names in the profile table "
-      "(Enter to send, Shift+Enter for new line)"
-    )
-    self.ai_fix_prompt.setMaximumHeight(90)
-    layout.addWidget(self.ai_fix_prompt)
-
-    btn_row = QHBoxLayout()
-    self.btn_send_ai_fix = QPushButton("Send")
-    self.btn_send_ai_fix.setObjectName("btnSendAiFix")
-    self.btn_new_ai_session = QPushButton("New Session")
-    self.btn_new_ai_session.setObjectName("btnRefresh")
-    self.btn_clear_ai_chat = QPushButton("Clear Chat")
-    self.btn_clear_ai_chat.setObjectName("btnRefresh")
-    btn_row.addWidget(self.btn_send_ai_fix)
-    btn_row.addWidget(self.btn_new_ai_session)
-    btn_row.addWidget(self.btn_clear_ai_chat)
-    btn_row.addStretch()
-    layout.addLayout(btn_row)
-
-    return tab
+  def _password_field(self, line_edit: QLineEdit) -> PasswordField:
+    self._configure_settings_line_edit(line_edit)
+    return PasswordField(line_edit)
 
   def _build_settings_tab(self) -> QWidget:
     tab = QWidget()
     root = QVBoxLayout(tab)
-    root.setContentsMargins(8, 8, 8, 8)
-    root.setSpacing(16)
+    root.setContentsMargins(8, 4, 8, 8)
+    root.setSpacing(4)
+
     outer = QHBoxLayout()
-    outer.setSpacing(16)
+    outer.setSpacing(14)
 
     left_col = QVBoxLayout()
-    right_col = QVBoxLayout()
+    left_col.setSpacing(0)
+    left_col.setContentsMargins(0, 0, 0, 0)
 
-    api_group = QGroupBox("API & Connection Settings")
-    api_form = QFormLayout(api_group)
+    api_card, api_body = make_settings_card(
+      "API & Connection Settings",
+      "CapSolver and AdsPower credentials for automation.",
+    )
+    api_card.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Maximum,
+    )
     self.capsolver_key = QLineEdit()
-    self.capsolver_key.setEchoMode(QLineEdit.EchoMode.Password)
     self.capsolver_key.setPlaceholderText("Leave empty for manual captcha solving in browser")
+    capsolver_field = self._password_field(self.capsolver_key)
     self.adspower_api_url = QLineEdit("http://local.adspower.com:50325")
     self.adspower_api_url.setPlaceholderText("http://local.adspower.com:50325")
+    self._configure_settings_line_edit(self.adspower_api_url)
     self.adspower_api_key = QLineEdit()
-    self.adspower_api_key.setEchoMode(QLineEdit.EchoMode.Password)
     self.adspower_api_key.setPlaceholderText("AdsPower Bearer API key")
-    api_form.addRow("CapSolver API Key:", self.capsolver_key)
-    api_form.addRow("AdsPower API URL:", self.adspower_api_url)
-    api_form.addRow("AdsPower API Key:", self.adspower_api_key)
-    left_col.addWidget(api_group)
+    adspower_key_field = self._password_field(self.adspower_api_key)
+    api_body.addWidget(make_labeled_field_row("CapSolver API Key:", capsolver_field, full_width=True))
+    api_body.addWidget(make_labeled_field_row("AdsPower API URL:", self.adspower_api_url, full_width=True))
+    api_body.addWidget(make_labeled_field_row("AdsPower API Key:", adspower_key_field, full_width=True))
 
-    target_group = QGroupBox("Targeting & Automation")
-    target_form = QFormLayout(target_group)
-    self.target_domains_edit = QPlainTextEdit()
-    self.target_domains_edit.setPlaceholderText("mysite.com\nothersite.com")
-    self.target_domains_edit.setMaximumHeight(72)
-    self.target_domains_edit.setToolTip("One target domain per line (max 5). All are searched on each SERP page.")
     launch_row = self._min_max_row(QSpinBox, 1, 3600, 1, 4)
+    start_delay_row = self._min_max_row(QSpinBox, 0, 3600, 10, 30)
     dwell_row = self._min_max_row(QSpinBox, 10, 3600, 60, 120)
+    internal_link_row = self._min_max_row(QSpinBox, 0, 5, 1, 1)
     warmup_dwell_row = self._min_max_row(QSpinBox, 1, 3600, 8, 16)
     warmup_count_row = self._min_max_row(QSpinBox, 1, 10, 1, 2)
     action_row = self._min_max_row(QDoubleSpinBox, 0.05, 5.0, 0.1, 0.3, step=0.05)
+    for spinboxes in (
+      launch_row, start_delay_row, dwell_row, internal_link_row,
+      warmup_dwell_row, warmup_count_row, action_row,
+    ):
+      self._configure_settings_spinbox(spinboxes[0])
+      self._configure_settings_spinbox(spinboxes[1])
     self.launch_min, self.launch_max = launch_row
+    self.session_start_delay_min, self.session_start_delay_max = start_delay_row
     self.dwell_min, self.dwell_max = dwell_row
+    self.internal_link_min, self.internal_link_max = internal_link_row
     self.warmup_dwell_min, self.warmup_dwell_max = warmup_dwell_row
     self.warmup_count_min, self.warmup_count_max = warmup_count_row
     self.action_delay_min, self.action_delay_max = action_row
+
     self.max_search_pages = QSpinBox()
     self.max_search_pages.setRange(1, 50)
     self.max_search_pages.setValue(8)
+    self._configure_settings_spinbox(self.max_search_pages)
     self.max_keywords_per_profile = QSpinBox()
     self.max_keywords_per_profile.setRange(1, 100)
     self.max_keywords_per_profile.setValue(3)
+    self._configure_settings_spinbox(self.max_keywords_per_profile)
     self.max_keywords_per_profile.setToolTip(
-      "Each profile runs this many keywords, then closes. "
-      "Next profile continues from the next keyword batch."
+      "When the assigned keyword/domain pair is not found, retry up to this many times "
+      "per profile. Retries try other target sites first; after all sites are tried, "
+      "the keyword changes (fresh search)."
+    )
+    self.failure_rate_auto_stop_percent = QSpinBox()
+    self.failure_rate_auto_stop_percent.setRange(0, 100)
+    self.failure_rate_auto_stop_percent.setValue(20)
+    self.failure_rate_auto_stop_percent.setSuffix("%")
+    self._configure_settings_spinbox(self.failure_rate_auto_stop_percent)
+    self.failure_rate_auto_stop_percent.setToolTip(
+      "Auto-stop automation when session failure rate exceeds this value.\n"
+      "0 = disabled. Default 20%."
+    )
+    self.failure_rate_auto_stop_min_attempts = QSpinBox()
+    self.failure_rate_auto_stop_min_attempts.setRange(1, 1000)
+    self.failure_rate_auto_stop_min_attempts.setValue(20)
+    self._configure_settings_spinbox(self.failure_rate_auto_stop_min_attempts)
+    self.failure_rate_auto_stop_min_attempts.setToolTip(
+      "Minimum completed session outcomes before failure-rate auto-stop is evaluated."
     )
     self.profile_os_mode_combo = QComboBox()
     self.profile_os_mode_combo.addItem("Mixed (Windows + Android)", "mixed")
     self.profile_os_mode_combo.addItem("Windows", "windows_only")
     self.profile_os_mode_combo.addItem("Android", "android_only")
+    self._configure_settings_combo(self.profile_os_mode_combo)
+    self.profile_os_mode_combo.setFixedWidth(SETTINGS_COMBO_OS_WIDTH)
     self.profile_os_mode_combo.setToolTip(
       "AdsPower profile OS for Create Profiles and Start Automation.\n"
-      "Mixed: random Windows/Android per profile.\n"
+      "Mixed: Android when result.csv shows mobile SERP page 1–2, or Windows page 1 "
+      "with no mobile history for that keyword+site; otherwise Windows.\n"
       "Windows / Android: create only that device type."
     )
-    target_form.addRow("Target Domains (max 5):", self.target_domains_edit)
-    target_form.addRow("Next Profile Launch Interval (sec):", self._wrap_row(launch_row))
-    target_form.addRow("Target Site Dwell Time (sec):", self._wrap_row(dwell_row))
-    target_form.addRow("Warm-up Dwell Time (sec):", self._wrap_row(warmup_dwell_row))
+    start_delay_row[0].setToolTip(
+      "Minimum idle time on Google after profile launch, before warm-up search."
+    )
+    start_delay_row[1].setToolTip(
+      "Maximum idle time on Google after profile launch, before warm-up search."
+    )
+    internal_link_row[0].setToolTip(
+      "Minimum internal link clicks on the target site during dwell (0 = scroll/select only)."
+    )
+    internal_link_row[1].setToolTip(
+      "Maximum internal link clicks during dwell (e.g. 1–1 = always once, 1–2 = once or twice)."
+    )
     warmup_count_row[0].setToolTip("Minimum number of warm-up Google searches per profile.")
     warmup_count_row[1].setToolTip("Maximum number of warm-up Google searches per profile.")
-    target_form.addRow("Warm-up Queries / Profile:", self._wrap_row(warmup_count_row))
-    target_form.addRow("Action Delay (sec):", self._wrap_row(action_row))
-    target_form.addRow("Max Search Pages:", self.max_search_pages)
-    target_form.addRow("Max Keywords / Profile:", self.max_keywords_per_profile)
-    target_form.addRow("Profile OS Mode:", self.profile_os_mode_combo)
-    self.chk_ip_check_session = QCheckBox("At session start")
+
+    session_card, session_body = make_settings_card(
+      "Session & Dwell",
+      "Launch timing, dwell duration, warm-up, and human-like delays.",
+    )
+    session_body.addWidget(make_range_row("Launch Interval", launch_row[0], launch_row[1]))
+    session_body.addWidget(make_range_row("Start Delay", start_delay_row[0], start_delay_row[1]))
+    session_body.addWidget(make_range_row("Dwell Time", dwell_row[0], dwell_row[1]))
+    session_body.addWidget(
+      make_range_row("Internal Links", internal_link_row[0], internal_link_row[1], unit=""),
+    )
+    session_body.addWidget(
+      make_range_row("Warm-up Dwell", warmup_dwell_row[0], warmup_dwell_row[1]),
+    )
+    session_body.addWidget(
+      make_range_row("Warm-up Queries", warmup_count_row[0], warmup_count_row[1], unit=""),
+    )
+    session_body.addWidget(make_range_row("Action Delay", action_row[0], action_row[1]))
+    session_body.addStretch(1)
+
+    automation_card, automation_body = make_settings_card(
+      "Search & Automation",
+      "SERP depth, retries, device OS, and traffic-saving options.",
+    )
+    session_card.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Expanding,
+    )
+    automation_card.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Expanding,
+    )
+    automation_body.addWidget(
+      make_labeled_field_row("Max SERP Pages:", self.max_search_pages),
+    )
+    automation_body.addWidget(
+      make_labeled_field_row("Max Retries / Profile:", self.max_keywords_per_profile),
+    )
+    automation_body.addWidget(
+      make_labeled_field_row("Failure Rate Auto-Stop:", self.failure_rate_auto_stop_percent),
+    )
+    automation_body.addWidget(
+      make_labeled_field_row("Auto-Stop Min Attempts:", self.failure_rate_auto_stop_min_attempts),
+    )
+    automation_body.addWidget(
+      make_labeled_field_row("Profile OS Mode:", self.profile_os_mode_combo),
+    )
+
+    self.chk_skip_exhausted_pairs = ToggleSwitch("Skip not-found pairs")
+    self.chk_skip_exhausted_pairs.setChecked(False)
+    self.chk_skip_exhausted_pairs.setToolTip(
+      "Off (default): if a keyword+site is not found after a full SERP scan, "
+      "it can be assigned again in the next cycle.\n"
+      "On: exclude that pair for the rest of this Start~Stop session."
+    )
+    automation_body.addWidget(
+      make_labeled_toggle_stack("Session Pair Skip:", [self.chk_skip_exhausted_pairs]),
+    )
+
+    self.chk_ip_check_session = ToggleSwitch("At session start")
     self.chk_ip_check_session.setChecked(False)
     self.chk_ip_check_session.setToolTip(
       "Off (default): skip proxy IP lookup when a profile session begins (saves traffic).\n"
-      "On: fetch egress IP once via lightweight browser fetch before opening Google."
+      "On: fetch egress IP via browser fetch before warm-up (retries up to 10s)."
     )
-    self.chk_ip_check_keyword2 = QCheckBox("Before 2nd keyword")
+    self.chk_ip_check_keyword2 = ToggleSwitch("Before 2nd keyword")
     self.chk_ip_check_keyword2.setChecked(False)
     self.chk_ip_check_keyword2.setToolTip(
       "Off (default): do not compare IP again before the 2nd keyword.\n"
       "On: re-check IP before keyword 2 and stop the profile if it changed "
       "(requires session-start IP check to capture a baseline)."
     )
-    ip_check_col = QVBoxLayout()
-    ip_check_col.setContentsMargins(0, 0, 0, 0)
-    ip_check_col.setSpacing(4)
-    ip_check_col.addWidget(self.chk_ip_check_session)
-    ip_check_col.addWidget(self.chk_ip_check_keyword2)
-    target_form.addRow("IP Check:", self._wrap_col(ip_check_col))
-    left_col.addWidget(target_group)
-    left_col.addStretch()
+    automation_body.addWidget(
+      make_labeled_toggle_stack("IP Check:", [
+        self.chk_ip_check_session,
+        self.chk_ip_check_keyword2,
+      ]),
+    )
 
-    proxy_group = QGroupBox("Proxy Setup (HTTP ISP)")
-    proxy_layout = QVBoxLayout(proxy_group)
-    proxy_hint = QLabel("Format: username:password@ip:port — one per line, HTTP by default")
-    proxy_hint.setObjectName("hintLabel")
-    proxy_layout.addWidget(proxy_hint)
+    self.chk_resource_blocking = ToggleSwitch("")
+    self.chk_resource_blocking.setChecked(True)
+    self.chk_resource_blocking.setToolTip(
+      "On (default): block images, video, fonts, Google ads, and FB/NAVER/DAUM/KAKAO "
+      "tracker scripts on SERP and target sites (saves residential proxy traffic).\n"
+      "Off: allow all resources — use with ISP or unlimited bandwidth proxies."
+    )
+    automation_body.addWidget(
+      make_labeled_toggle_stack("Resource Block:", [self.chk_resource_blocking]),
+    )
+    automation_body.addStretch(1)
+
+    targeting_panel = QWidget()
+    targeting_panel.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Expanding,
+    )
+    targeting_row = QHBoxLayout(targeting_panel)
+    targeting_row.setContentsMargins(0, 0, 0, 0)
+    targeting_row.setSpacing(14)
+    targeting_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+    targeting_row.addWidget(session_card, stretch=1)
+    targeting_row.addWidget(automation_card, stretch=1)
+
+    domains_card, domains_body = make_settings_card(
+      "Target Domains (max 5)",
+      "One domain per line — all are searched on each SERP page.",
+    )
+    domains_card.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Preferred,
+    )
+    self.target_domains_edit = QPlainTextEdit()
+    self.target_domains_edit.setObjectName("settingsMultilineEdit")
+    self.target_domains_edit.setPlaceholderText("mysite.com\nothersite.com")
+    self.target_domains_edit.setToolTip(
+      "One target domain per line (max 5). All are searched on each SERP page."
+    )
+    self.target_domains_edit.setMinimumHeight(108)
+    self.target_domains_edit.setMaximumHeight(108)
+    domains_body.addWidget(self.target_domains_edit)
+
+    top_row_panel = QWidget()
+    top_row_panel.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Maximum,
+    )
+    top_row = QHBoxLayout(top_row_panel)
+    top_row.setContentsMargins(0, 0, 0, 0)
+    top_row.setSpacing(14)
+    top_row.setAlignment(Qt.AlignmentFlag.AlignTop)
+    top_row.addWidget(api_card, stretch=2)
+    top_row.addWidget(domains_card, stretch=1)
+
+    left_col.addWidget(targeting_panel, stretch=1)
+
+    self.btn_save_settings = QPushButton("Save Settings")
+    self.btn_save_settings.setObjectName("btnSaveSettings")
+    self.btn_save_settings.setFixedSize(180, 42)
+    save_row = QHBoxLayout()
+    save_row.setContentsMargins(0, 10, 0, 6)
+    save_row.addStretch()
+    save_row.addWidget(self.btn_save_settings)
+    save_row.addStretch()
+    left_col.addLayout(save_row)
+
+    right_col = QVBoxLayout()
+    right_col.setSpacing(6)
+    right_col.setContentsMargins(0, 0, 0, 0)
+
+    proxy_card, proxy_body = make_settings_card(
+      "Proxy Setup",
+      "Format: username:password@ip:port — one per line.",
+    )
     self.proxies_edit = self._make_settings_multiline_edit(
       "myuser:mypass@123.45.67.89:10000",
-      min_height=100,
     )
-    proxy_layout.addWidget(self.proxies_edit)
-    right_col.addWidget(proxy_group)
+    proxy_body.addWidget(self.proxies_edit, stretch=1)
+    right_col.addWidget(proxy_card, stretch=1)
 
-    kw_group = QGroupBox("Keyword List")
-    kw_layout = QVBoxLayout(kw_group)
-    self.keywords_edit = self._make_settings_multiline_edit("One keyword per line", min_height=100)
-    kw_layout.addWidget(self.keywords_edit)
-    right_col.addWidget(kw_group)
+    kw_card, kw_body = make_settings_card(
+      "Keyword List",
+      "Target search keywords — one per line.",
+    )
+    self.keywords_edit = self._make_settings_multiline_edit("One keyword per line")
+    kw_body.addWidget(self.keywords_edit, stretch=1)
+    right_col.addWidget(kw_card, stretch=1)
 
-    warmup_group = QGroupBox("Warm-up Query List")
-    warmup_layout = QVBoxLayout(warmup_group)
-    self.warmup_edit = self._make_settings_multiline_edit("One warm-up query per line", min_height=100)
-    warmup_layout.addWidget(self.warmup_edit)
-    right_col.addWidget(warmup_group)
-    right_col.addStretch()
+    warmup_card, warmup_body = make_settings_card(
+      "Warm-up Query List",
+      "Neutral queries used before target keyword searches.",
+    )
+    self.warmup_edit = self._make_settings_multiline_edit("One warm-up query per line")
+    warmup_body.addWidget(self.warmup_edit, stretch=1)
+    right_col.addWidget(warmup_card, stretch=1)
 
     left_widget = QWidget()
     left_widget.setLayout(left_col)
+    left_widget.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Expanding,
+    )
     right_widget = QWidget()
     right_widget.setLayout(right_col)
-    outer.addWidget(left_widget, stretch=1)
+    right_widget.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Expanding,
+    )
+    outer.addWidget(left_widget, stretch=2)
     outer.addWidget(right_widget, stretch=1)
-    root.addLayout(outer, stretch=1)
 
-    save_bar = QHBoxLayout()
-    save_bar.addStretch()
-    self.btn_save_settings = QPushButton("Save Settings")
-    self.btn_save_settings.setObjectName("btnSaveSettings")
-    save_bar.addWidget(self.btn_save_settings)
-    save_bar.addStretch()
-    root.addLayout(save_bar)
+    content = QWidget()
+    content_layout = QVBoxLayout(content)
+    content_layout.setContentsMargins(0, 0, 0, 0)
+    content_layout.setSpacing(10)
+    content_layout.addWidget(top_row_panel, 0)
+    content_layout.addLayout(outer, stretch=1)
+
+    root.addWidget(content, stretch=1)
     return tab
 
   def _build_result_tab(self) -> QWidget:
@@ -1091,26 +1453,23 @@ class UiMainWindow(QMainWindow):
 
     traffic_box = QVBoxLayout()
     traffic_box.setSpacing(1)
-    traffic_title = QLabel("Traffic")
+    traffic_title = QLabel("Proxy Traffic")
     traffic_title.setObjectName("trafficTotalTitle")
+    traffic_title.setToolTip(
+      "CDP wire estimate (upload+download). Matches residential proxy billing more closely than body-only meters."
+    )
     self.result_traffic_value = QLabel("0 B")
     self.result_traffic_value.setObjectName("trafficTotalValue")
     traffic_box.addWidget(traffic_title, alignment=Qt.AlignmentFlag.AlignRight)
     traffic_box.addWidget(self.result_traffic_value, alignment=Qt.AlignmentFlag.AlignRight)
 
-    failed_box = QVBoxLayout()
-    failed_box.setSpacing(1)
-    failed_title = QLabel("Not Found")
-    failed_title.setObjectName("trafficTotalTitle")
     self.result_not_found_value = QLabel("0")
     self.result_not_found_value.setObjectName("trafficTotalValue")
-    failed_box.addWidget(failed_title, alignment=Qt.AlignmentFlag.AlignRight)
-    failed_box.addWidget(self.result_not_found_value, alignment=Qt.AlignmentFlag.AlignRight)
+    self.result_not_found_value.hide()
 
     stats_row.addStretch()
     stats_row.addLayout(total_box)
     stats_row.addLayout(traffic_box)
-    stats_row.addLayout(failed_box)
 
     header_row.addWidget(sessions_title, stretch=1)
     header_row.addLayout(stats_row, stretch=3)
@@ -1124,15 +1483,7 @@ class UiMainWindow(QMainWindow):
     sessions_panel_layout.setSpacing(8)
     self.result_session_list = QListWidget()
     self.result_session_list.setObjectName("resultSessionList")
-    sessions_actions = QHBoxLayout()
-    sessions_actions.setSpacing(8)
-    self.btn_delete_result_session = QPushButton("Delete")
-    self.btn_delete_result_session.setObjectName("btnDeleteResult")
-    self.btn_delete_result_session.setToolTip("Delete the selected session and its CSV file")
-    sessions_actions.addWidget(self.btn_delete_result_session)
-    sessions_actions.addStretch()
     sessions_panel_layout.addWidget(self.result_session_list, stretch=1)
-    sessions_panel_layout.addLayout(sessions_actions)
 
     table_panel = QWidget()
     table_panel_layout = QVBoxLayout(table_panel)
@@ -1178,10 +1529,17 @@ class UiMainWindow(QMainWindow):
 
     footer_row = QHBoxLayout()
     footer_row.setSpacing(12)
+    result_action_size = (110, 36)
+    self.btn_delete_result_session = QPushButton("Delete")
+    self.btn_delete_result_session.setObjectName("btnDeleteResult")
+    self.btn_delete_result_session.setToolTip("Delete the selected session and its CSV file")
+    self.btn_delete_result_session.setFixedSize(*result_action_size)
     self.btn_refresh_results = QPushButton("Refresh")
-    self.btn_refresh_results.setObjectName("btnRefresh")
-    footer_row.addWidget(self.btn_refresh_results, stretch=1)
-    footer_row.addStretch(3)
+    self.btn_refresh_results.setObjectName("btnRefreshResults")
+    self.btn_refresh_results.setFixedSize(*result_action_size)
+    footer_row.addWidget(self.btn_delete_result_session)
+    footer_row.addStretch()
+    footer_row.addWidget(self.btn_refresh_results)
 
     content.addLayout(header_row)
     content.addLayout(body_row, stretch=1)
@@ -1198,27 +1556,49 @@ class UiMainWindow(QMainWindow):
     self._result_table_filter: str = "all"
     self._result_click_domain_filter: str = "all"
     self._result_domain_buttons: list[QPushButton] = []
+    self._result_list_loaded = False
+    self._result_files_signature = ""
     self.result_session_list.currentItemChanged.connect(self._on_result_session_selected)
-    self.btn_refresh_results.clicked.connect(self._refresh_result_file_list)
+    self.btn_refresh_results.clicked.connect(lambda: self._refresh_result_file_list(force=True))
     self.btn_delete_result_session.clicked.connect(self._delete_selected_result_session)
     self.result_domain_button_group.buttonClicked.connect(self._on_result_domain_filter_clicked)
     self.result_click_domain_combo.currentIndexChanged.connect(self._on_result_click_domain_combo_changed)
-    QTimer.singleShot(0, self._refresh_result_file_list)
+    QTimer.singleShot(0, lambda: self._refresh_result_file_list(force=True))
     return tab
 
-  def _refresh_result_file_list(self) -> None:
+  @staticmethod
+  def _compute_result_files_signature(files: list[Path]) -> str:
+    parts: list[str] = []
+    for path in files:
+      try:
+        stat = path.stat()
+        parts.append(f"{path.name}:{stat.st_mtime_ns}:{stat.st_size}")
+      except OSError:
+        parts.append(path.name)
+    return "|".join(parts)
+
+  def _refresh_result_file_list(self, *, force: bool = False) -> None:
     if getattr(self, "_refreshing_result_list", False):
       return
     self._refreshing_result_list = True
     try:
+      files = list_session_result_files(self._data_dir)
+      signature = self._compute_result_files_signature(files)
+      if (
+        not force
+        and self._result_list_loaded
+        and signature == self._result_files_signature
+        and self._result_loaded_path is not None
+      ):
+        return
+
       selected_path = ""
       current = self.result_session_list.currentItem()
       if current is not None:
         selected_path = str(current.data(Qt.ItemDataRole.UserRole) or "")
 
-      data_dir = self._project_root / "data"
-      files = list_session_result_files(data_dir)
       self._result_session_files = files
+      self._result_files_signature = signature
 
       self.result_session_list.blockSignals(True)
       self.result_session_list.clear()
@@ -1238,6 +1618,7 @@ class UiMainWindow(QMainWindow):
         self._load_result_session(files[select_row])
       else:
         self._clear_result_session_view()
+      self._result_list_loaded = True
     finally:
       self._refreshing_result_list = False
 
@@ -1278,7 +1659,8 @@ class UiMainWindow(QMainWindow):
     self._result_session_domains = session_target_domains(headers, rows, meta)
     self._result_table_filter = "all"
     self._result_click_domain_filter = "all"
-    self.result_total_clicks_value.setText(str(len(rows)))
+    successes, _failures = count_session_click_outcomes(path)
+    self.result_total_clicks_value.setText(str(successes))
 
     traffic_raw = (meta.get("traffic_bytes") or "").strip()
     try:
@@ -1290,15 +1672,7 @@ class UiMainWindow(QMainWindow):
       traffic_bytes = max(traffic_bytes, self._controller.get_session_traffic_total())
     self.result_traffic_value.setText(self._format_bytes(traffic_bytes))
 
-    session_start, session_end = session_result_window(path, self._result_session_files)
-    not_found = 0
-    if session_start is not None:
-      not_found = count_target_not_found_in_session(
-        session_start,
-        session_end,
-        session_log_path=self._project_root / "data" / "session.log",
-      )
-    self.result_not_found_value.setText(str(not_found))
+    self.result_not_found_value.setText("0")
     self._rebuild_result_domain_buttons()
     self._render_result_table()
 
@@ -1395,7 +1769,7 @@ class UiMainWindow(QMainWindow):
     except OSError as exc:
       self.append_log(f"[UI] Failed to delete session file: {exc}")
       return
-    self._refresh_result_file_list()
+    self._refresh_result_file_list(force=True)
 
   def _render_result_table(self) -> None:
     if self._result_table_filter != "all":
@@ -1407,7 +1781,12 @@ class UiMainWindow(QMainWindow):
     headers = self._result_loaded_headers
     rows = self._result_loaded_rows
     if self._result_click_domain_filter != "all":
-      rows = filter_click_rows_by_domain(headers, rows, self._result_click_domain_filter)
+      rows = filter_click_rows_by_domain(
+        headers,
+        rows,
+        self._result_click_domain_filter,
+        meta=self._result_loaded_meta,
+      )
     display_headers = headers or [
       "datetime",
       "profile_name",
@@ -1418,29 +1797,37 @@ class UiMainWindow(QMainWindow):
       "rank",
       "overall_rank",
     ]
-    self.result_table.setColumnCount(len(display_headers))
-    self.result_table.setHorizontalHeaderLabels(display_headers)
-    self.result_table.setRowCount(len(rows))
-    for row_index, row in enumerate(rows):
-      for col_index, header_name in enumerate(display_headers):
-        value = row[col_index] if col_index < len(row) else ""
-        self.result_table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
-    self._resize_result_table_columns(len(display_headers))
+    self.result_table.setUpdatesEnabled(False)
+    self.result_table.blockSignals(True)
+    try:
+      self.result_table.setColumnCount(len(display_headers))
+      self.result_table.setHorizontalHeaderLabels(display_headers)
+      self.result_table.setRowCount(len(rows))
+      for row_index, row in enumerate(rows):
+        for col_index, header_name in enumerate(display_headers):
+          value = row[col_index] if col_index < len(row) else ""
+          self.result_table.setItem(row_index, col_index, QTableWidgetItem(str(value)))
+      self._resize_result_table_columns(len(display_headers))
+    finally:
+      self.result_table.blockSignals(False)
+      self.result_table.setUpdatesEnabled(True)
 
   def _render_result_keyword_table(self, domain: str) -> None:
     summaries = aggregate_keyword_clicks_for_domain(
       self._result_loaded_headers,
       self._result_loaded_rows,
       domain,
+      meta=self._result_loaded_meta,
     )
-    display_headers = ("keyword", "total_clicks", "windows", "mobile")
+    display_headers = ("keyword", "total_clicks", "windows", "mobile", "not_found")
     self.result_table.setColumnCount(len(display_headers))
     self.result_table.setHorizontalHeaderLabels(
-      ["Keyword", "Total Clicks", "Windows", "Mobile"]
+      ["Keyword", "Total Clicks", "Windows", "Mobile", "Not Found"]
     )
     total_clicks = sum(summary["total"] for summary in summaries)
     total_windows = sum(summary["windows"] for summary in summaries)
     total_mobile = sum(summary["mobile"] for summary in summaries)
+    total_not_found = sum(summary["not_found"] for summary in summaries)
     self.result_table.setRowCount(len(summaries) + 1)
     for row_index, summary in enumerate(summaries):
       values = (
@@ -1448,6 +1835,7 @@ class UiMainWindow(QMainWindow):
         str(summary["total"]),
         str(summary["windows"]),
         str(summary["mobile"]),
+        str(summary["not_found"]),
       )
       for col_index, value in enumerate(values):
         self.result_table.setItem(row_index, col_index, QTableWidgetItem(value))
@@ -1455,7 +1843,13 @@ class UiMainWindow(QMainWindow):
     footer_row = len(summaries)
     footer_font = QFont()
     footer_font.setBold(True)
-    footer_values = ("Total", str(total_clicks), str(total_windows), str(total_mobile))
+    footer_values = (
+      "Total",
+      str(total_clicks),
+      str(total_windows),
+      str(total_mobile),
+      str(total_not_found),
+    )
     for col_index, value in enumerate(footer_values):
       item = QTableWidgetItem(value)
       item.setFont(footer_font)
@@ -1469,14 +1863,24 @@ class UiMainWindow(QMainWindow):
       header.setSectionResizeMode(col_index, QHeaderView.ResizeMode.ResizeToContents)
 
   def _on_main_tab_changed(self, index: int) -> None:
-    if index == getattr(self, "_result_tab_index", -1):
+    if index != getattr(self, "_result_tab_index", -1):
+      return
+    if not self._result_list_loaded:
       self._refresh_result_file_list()
+      return
+    files = list_session_result_files(self._data_dir)
+    if self._compute_result_files_signature(files) != self._result_files_signature:
+      self._refresh_result_file_list(force=True)
 
-  def _make_settings_multiline_edit(self, placeholder: str, *, min_height: int = 100) -> QPlainTextEdit:
+  def _make_settings_multiline_edit(self, placeholder: str, *, min_height: int = 48) -> QPlainTextEdit:
     edit = QPlainTextEdit()
     edit.setObjectName("settingsMultilineEdit")
     edit.setPlaceholderText(placeholder)
     edit.setMinimumHeight(min_height)
+    edit.setSizePolicy(
+      QSizePolicy.Policy.Expanding,
+      QSizePolicy.Policy.Expanding,
+    )
     palette = edit.palette()
     palette.setColor(QPalette.ColorRole.Text, QColor("#e2e8f0"))
     palette.setColor(QPalette.ColorRole.Base, QColor("#0a0d14"))
@@ -1497,22 +1901,38 @@ class UiMainWindow(QMainWindow):
     return lo, hi
 
   @staticmethod
-  def _wrap_row(spinboxes: tuple) -> QWidget:
+  def _wrap_min_max(spinboxes: tuple) -> QWidget:
     row = QHBoxLayout()
-    row.addWidget(QLabel("Min"))
-    row.addWidget(spinboxes[0])
-    row.addWidget(QLabel("Max"))
-    row.addWidget(spinboxes[1])
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    min_label = QLabel("Min")
+    min_label.setObjectName("hintLabel")
+    max_label = QLabel("Max")
+    max_label.setObjectName("hintLabel")
+    row.addWidget(min_label, 0, Qt.AlignmentFlag.AlignVCenter)
+    row.addWidget(spinboxes[0], 0, Qt.AlignmentFlag.AlignVCenter)
+    row.addSpacing(6)
+    row.addWidget(max_label, 0, Qt.AlignmentFlag.AlignVCenter)
+    row.addWidget(spinboxes[1], 0, Qt.AlignmentFlag.AlignVCenter)
     row.addStretch()
     container = QWidget()
+    container.setFixedHeight(32)
     container.setLayout(row)
     return container
 
   @staticmethod
-  def _wrap_col(layout: QVBoxLayout) -> QWidget:
+  def _wrap_row(spinboxes: tuple) -> QWidget:
+    return UiMainWindow._wrap_min_max(spinboxes)
+
+  @staticmethod
+  def _wrap_row_layout(layout: QHBoxLayout | QVBoxLayout) -> QWidget:
     container = QWidget()
     container.setLayout(layout)
     return container
+
+  @staticmethod
+  def _wrap_col(layout: QVBoxLayout) -> QWidget:
+    return UiMainWindow._wrap_row_layout(layout)
 
   def _wire_signals(self) -> None:
     self.btn_create.clicked.connect(self.on_create_profiles)
@@ -1520,16 +1940,15 @@ class UiMainWindow(QMainWindow):
     self.btn_start_auto.clicked.connect(self.on_start_automated)
     self.btn_stop_auto.clicked.connect(self.on_stop_automated)
     self.btn_save_settings.clicked.connect(self.on_save_settings)
-    self.btn_send_ai_fix.clicked.connect(self.on_send_ai_fix)
-    self.btn_new_ai_session.clicked.connect(self.on_new_ai_session)
-    self.btn_clear_ai_chat.clicked.connect(self.on_clear_ai_chat)
     self.chk_select_all.stateChanged.connect(self._on_select_all_changed)
     self.btn_bulk_start.clicked.connect(self.on_bulk_start)
     self.btn_bulk_pause.clicked.connect(self.on_bulk_pause)
     self.btn_bulk_kill.clicked.connect(self.on_bulk_kill)
     self.btn_bulk_delete.clicked.connect(self.on_bulk_delete)
-    self.tabs.currentChanged.connect(self._on_main_tab_changed)
-    self._controller.log.connect(self.append_log, Qt.ConnectionType.QueuedConnection)
+    self._controller.log.connect(
+      lambda msg: self.append_log(msg, persist=False),
+      Qt.ConnectionType.QueuedConnection,
+    )
     self._controller.profile_update.connect(self._on_profile_update, Qt.ConnectionType.QueuedConnection)
     self._controller.proxy_traffic_update.connect(
       self._on_proxy_traffic_update,
@@ -1549,6 +1968,10 @@ class UiMainWindow(QMainWindow):
     )
     self._controller.target_click_logged.connect(
       self._refresh_overall_clicks,
+      Qt.ConnectionType.QueuedConnection,
+    )
+    self._controller.captcha_stat.connect(
+      self._on_captcha_stat,
       Qt.ConnectionType.QueuedConnection,
     )
     self._controller.target_click_logged.connect(
@@ -1572,174 +1995,34 @@ class UiMainWindow(QMainWindow):
       Qt.ConnectionType.QueuedConnection,
     )
     self._controller.global_finished.connect(self._on_global_finished, Qt.ConnectionType.QueuedConnection)
-    self._self_healer.log.connect(self.append_log, Qt.ConnectionType.QueuedConnection)
-    self._self_healer.healing_started.connect(
-      self._on_profile_healing_started, Qt.ConnectionType.QueuedConnection
-    )
-    self._self_healer.healing_finished.connect(
-      self._on_profile_healing_finished, Qt.ConnectionType.QueuedConnection
-    )
 
-  def _scroll_ai_fix_chat(self) -> None:
-    scrollbar = self.ai_fix_chat.verticalScrollBar()
-    scrollbar.setValue(scrollbar.maximum())
+  def append_log(self, message: str, *, persist: bool = True) -> None:
+    from utils.session_log import append_session_log
+    from utils.user_log import format_user_log, format_user_log_html
 
-  def _ai_fix_append_system(self, text: str) -> None:
-    safe = escape(text).replace("\n", "<br>")
-    self.ai_fix_chat.append(f'<p style="color:#64748b;margin:4px 0;">{safe}</p>')
-    self._scroll_ai_fix_chat()
-    self._schedule_ai_chat_persist()
-
-  def _ai_fix_append_user(self, text: str) -> None:
-    safe = escape(text).replace("\n", "<br>")
-    self.ai_fix_chat.append(f'<p style="color:#93c5fd;margin:8px 0 4px 0;"><b>You:</b> {safe}</p>')
-    self._scroll_ai_fix_chat()
-    self._schedule_ai_chat_persist()
-
-  def _ai_fix_begin_assistant(self) -> None:
-    self.ai_fix_chat.append('<p style="color:#e2e8f0;margin:8px 0 4px 0;"><b>Cursor:</b> ')
-    self._ai_fix_assistant_open = True
-    self._scroll_ai_fix_chat()
-    self._schedule_ai_chat_persist()
-
-  def _ai_fix_append_assistant_text(self, text: str) -> None:
-    if not text:
-      return
-    if not self._ai_fix_assistant_open:
-      self._ai_fix_begin_assistant()
-    cursor = QTextCursor(self.ai_fix_chat.document())
-    cursor.movePosition(QTextCursor.MoveOperation.End)
-    cursor.insertText(text)
-    self._scroll_ai_fix_chat()
-    self._schedule_ai_chat_persist()
-
-  def _ai_fix_end_assistant(self) -> None:
-    if self._ai_fix_assistant_open:
-      self.ai_fix_chat.append("</p>")
-      self._ai_fix_assistant_open = False
-      self._scroll_ai_fix_chat()
-      self._schedule_ai_chat_persist()
-
-  def _ai_fix_append_status(self, text: str) -> None:
-    safe = escape(text).replace("\n", "<br>")
-    self.ai_fix_chat.append(f'<p style="color:#94a3b8;margin:2px 0;font-size:12px;">{safe}</p>')
-    self._scroll_ai_fix_chat()
-    self._schedule_ai_chat_persist()
-
-  def _schedule_ai_chat_persist(self) -> None:
-    if self._ai_chat_persist_timer.isActive():
-      self._ai_chat_persist_timer.stop()
-    self._ai_chat_persist_timer.start()
-
-  def _initialize_ai_chat(self) -> None:
-    self.ai_fix_chat.clear()
-    self._ai_fix_assistant_open = False
-    self._ai_fix_append_system(
-      "Ready. Enter your Cursor API key, describe a fix, and press Send. "
-      "Tool calls and edits stream here in real time."
-    )
-
-  def _persist_ai_chat_state(self) -> None:
-    try:
-      save_settings(self._collect_settings_dict())
-    except Exception:
-      pass
-
-  def _set_ai_fix_busy(self, busy: bool) -> None:
-    self.btn_send_ai_fix.setEnabled(not busy)
-    self.ai_fix_prompt.setEnabled(not busy)
-
-  def _cursor_model_value(self) -> str:
-    if isinstance(self.cursor_model, QComboBox):
-      return normalize_cursor_model(self.cursor_model.currentText())
-    return normalize_cursor_model(self.cursor_model.text())
-
-  def on_send_ai_fix(self) -> None:
-    prompt = self.ai_fix_prompt.toPlainText().strip()
-    if not prompt:
-      self._ai_fix_append_system("Enter a prompt before sending.")
-      return
-
-    api_key = self.cursor_api_key.text().strip()
-    if not api_key:
-      self._ai_fix_append_system(
-        "Cursor API Key is required. Get one at https://cursor.com/dashboard/integrations"
-      )
-      return
-
-    if self._cursor_chat.is_running():
-      self._ai_fix_append_system("Agent is still running — wait for the current request to finish.")
-      return
-
-    try:
-      save_settings(self._collect_settings_dict())
-    except Exception:
-      pass
-
-    self._ai_fix_append_user(prompt)
-    self.ai_fix_prompt.clear()
-    self._set_ai_fix_busy(True)
-
-    worker = self._cursor_chat.start_run(
-      api_key=api_key,
-      model=self._cursor_model_value(),
-      prompt=prompt,
-      parent=self,
-    )
-    if worker is None:
-      self._set_ai_fix_busy(False)
-      self._ai_fix_append_system("Could not start Cursor agent.")
-      return
-
-    worker.status_line.connect(self._ai_fix_append_status, Qt.ConnectionType.QueuedConnection)
-    worker.text_delta.connect(self._ai_fix_append_assistant_text, Qt.ConnectionType.QueuedConnection)
-    worker.completed.connect(self._on_ai_fix_completed, Qt.ConnectionType.QueuedConnection)
-
-  def _on_ai_fix_completed(self, success: bool, message: str, agent_id: str) -> None:
-    self._ai_fix_end_assistant()
-    self._set_ai_fix_busy(False)
-    prefix = "✓" if success else "✗"
-    self._ai_fix_append_status(f"{prefix} {message}")
-    if agent_id:
-      self._ai_fix_append_status(f"Session agent: {agent_id}")
-    if success:
-      self._ai_fix_append_system("Restart the app to load Python/UI changes.")
-    self.append_log(f"[AI Fix] {'OK' if success else 'FAILED'}: {message}")
-    self._schedule_ai_chat_persist()
-
-  def on_new_ai_session(self) -> None:
-    if self._cursor_chat.is_running():
-      self._ai_fix_append_system("Wait for the current run to finish before starting a new session.")
-      return
-    self._cursor_chat.reset_session()
-    self._ai_fix_append_system("Started a new Cursor agent session (conversation context cleared).")
-    self._schedule_ai_chat_persist()
-
-  def on_clear_ai_chat(self) -> None:
-    if self._cursor_chat.is_running():
-      self._ai_fix_append_system("Wait for the current run to finish before clearing chat.")
-      return
-    self._cursor_chat.reset_session()
-    self._initialize_ai_chat()
-    self._schedule_ai_chat_persist()
-
-  def append_log(self, message: str) -> None:
-    from utils.user_log import format_user_log
-
-    try:
-      log_path = Path("data/session.log")
-      log_path.parent.mkdir(parents=True, exist_ok=True)
-      stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-      with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"{stamp} {message}\n")
-    except Exception:
-      pass
+    if persist:
+      append_session_log(message)
 
     user_line = format_user_log(message)
     if not user_line:
       return
     time_stamp = datetime.now().strftime("%H:%M:%S")
-    self.log_view.appendPlainText(f"{time_stamp} {user_line}")
+    html_line = format_user_log_html(user_line, time_stamp)
+    self.log_view.append(html_line)
+    scrollbar = self.log_view.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum())
+
+  def _warn_capsolver_key_missing(self) -> None:
+    if self.capsolver_key.text().strip():
+      return
+    message = "CapSolver API 키가 없으므로 캡쳐가 나오면 프로필을 삭제합니다."
+    from utils.session_log import append_session_log
+
+    append_session_log(f"[UI] {message}")
+    time_stamp = datetime.now().strftime("%H:%M:%S")
+    self.log_view.append(
+      f'<span style="color:#f87171">[{time_stamp}] {message}</span>'
+    )
     scrollbar = self.log_view.verticalScrollBar()
     scrollbar.setValue(scrollbar.maximum())
 
@@ -1850,23 +2133,20 @@ class UiMainWindow(QMainWindow):
     return self._normalize_profile_os_mode(str(data or "mixed"))
 
   def _collect_settings_dict(self) -> dict:
-    cursor_key = self.cursor_api_key.text().strip()
-    cursor_model = self._cursor_model_value()
     return {
       "capsolver_api_key": self.capsolver_key.text().strip(),
       "adspower_api_url": self.adspower_api_url.text().strip(),
       "adspower_api_key": self.adspower_api_key.text().strip(),
-      "cursor_api_key": cursor_key,
-      "cursor_model": cursor_model,
-      "llm_api_key": cursor_key,
-      "llm_base_url": "https://api.cursor.com/v1",
-      "llm_model": cursor_model,
       "target_domains_text": self.target_domains_edit.toPlainText(),
       "target_domain": self._primary_target_domain_from_ui(),
       "launch_interval_min": self.launch_min.value(),
       "launch_interval_max": self.launch_max.value(),
+      "session_start_delay_min": self.session_start_delay_min.value(),
+      "session_start_delay_max": self.session_start_delay_max.value(),
       "dwell_min": self.dwell_min.value(),
       "dwell_max": self.dwell_max.value(),
+      "internal_link_min": self.internal_link_min.value(),
+      "internal_link_max": self.internal_link_max.value(),
       "warmup_dwell_min": self.warmup_dwell_min.value(),
       "warmup_dwell_max": self.warmup_dwell_max.value(),
       "warmup_count_min": self.warmup_count_min.value(),
@@ -1875,8 +2155,12 @@ class UiMainWindow(QMainWindow):
       "action_delay_max": self.action_delay_max.value(),
       "max_search_pages": self.max_search_pages.value(),
       "max_keywords_per_profile": self.max_keywords_per_profile.value(),
+      "failure_rate_auto_stop_percent": self.failure_rate_auto_stop_percent.value(),
+      "failure_rate_auto_stop_min_attempts": self.failure_rate_auto_stop_min_attempts.value(),
       "ip_check_session_start": self.chk_ip_check_session.isChecked(),
       "ip_check_enabled": self.chk_ip_check_keyword2.isChecked(),
+      "skip_exhausted_pairs_in_session": self.chk_skip_exhausted_pairs.isChecked(),
+      "resource_blocking_enabled": self.chk_resource_blocking.isChecked(),
       "profile_count": self.profile_count_spin.value(),
       "profile_os_mode": self._profile_os_mode_from_ui(),
       "automation_threads": self.threads_spin.value(),
@@ -1884,8 +2168,6 @@ class UiMainWindow(QMainWindow):
       "proxies_text": self.proxies_edit.toPlainText(),
       "keywords_text": self.keywords_edit.toPlainText(),
       "warmup_text": self.warmup_edit.toPlainText(),
-      "ai_fix_chat_html": self.ai_fix_chat.toHtml(),
-      "ai_fix_agent_id": self._cursor_chat.agent_id,
     }
 
   def _apply_settings_dict(self, data: dict) -> None:
@@ -1893,15 +2175,6 @@ class UiMainWindow(QMainWindow):
     if data.get("adspower_api_url"):
       self.adspower_api_url.setText(data["adspower_api_url"])
     self.adspower_api_key.setText(data.get("adspower_api_key", ""))
-    cursor_key = data.get("cursor_api_key", "").strip()
-    if not cursor_key:
-      legacy_llm = data.get("llm_api_key", "").strip()
-      if legacy_llm.startswith(("cursor_", "crsr_")):
-        cursor_key = legacy_llm
-    self.cursor_api_key.setText(cursor_key)
-    self.cursor_model.setCurrentText(
-      normalize_cursor_model(data.get("cursor_model") or data.get("llm_model") or DEFAULT_CURSOR_MODEL)
-    )
     legacy_target = data.get("target_domain", "").strip()
     domains_text = data.get("target_domains_text", "").strip()
     if not domains_text and legacy_target:
@@ -1909,8 +2182,20 @@ class UiMainWindow(QMainWindow):
     self.target_domains_edit.setPlainText(domains_text)
     self.launch_min.setValue(int(data.get("launch_interval_min", self.launch_min.value())))
     self.launch_max.setValue(int(data.get("launch_interval_max", self.launch_max.value())))
+    self.session_start_delay_min.setValue(
+      int(data.get("session_start_delay_min", self.session_start_delay_min.value()))
+    )
+    self.session_start_delay_max.setValue(
+      int(data.get("session_start_delay_max", self.session_start_delay_max.value()))
+    )
     self.dwell_min.setValue(int(data.get("dwell_min", self.dwell_min.value())))
     self.dwell_max.setValue(int(data.get("dwell_max", self.dwell_max.value())))
+    self.internal_link_min.setValue(
+      int(data.get("internal_link_min", self.internal_link_min.value()))
+    )
+    self.internal_link_max.setValue(
+      int(data.get("internal_link_max", self.internal_link_max.value()))
+    )
     self.warmup_dwell_min.setValue(int(data.get("warmup_dwell_min", self.warmup_dwell_min.value())))
     self.warmup_dwell_max.setValue(int(data.get("warmup_dwell_max", self.warmup_dwell_max.value())))
     self.warmup_count_min.setValue(int(data.get("warmup_count_min", self.warmup_count_min.value())))
@@ -1921,8 +2206,23 @@ class UiMainWindow(QMainWindow):
     self.max_keywords_per_profile.setValue(
       int(data.get("max_keywords_per_profile", self.max_keywords_per_profile.value()))
     )
+    self.failure_rate_auto_stop_percent.setValue(
+      int(data.get("failure_rate_auto_stop_percent", self.failure_rate_auto_stop_percent.value()))
+    )
+    self.failure_rate_auto_stop_min_attempts.setValue(
+      int(
+        data.get(
+          "failure_rate_auto_stop_min_attempts",
+          self.failure_rate_auto_stop_min_attempts.value(),
+        )
+      )
+    )
     self.chk_ip_check_session.setChecked(bool(data.get("ip_check_session_start", False)))
     self.chk_ip_check_keyword2.setChecked(bool(data.get("ip_check_enabled", False)))
+    self.chk_skip_exhausted_pairs.setChecked(
+      bool(data.get("skip_exhausted_pairs_in_session", False))
+    )
+    self.chk_resource_blocking.setChecked(bool(data.get("resource_blocking_enabled", True)))
     self.profile_count_spin.setValue(int(data.get("profile_count", self.profile_count_spin.value())))
     self._set_profile_os_mode_combo(str(data.get("profile_os_mode", "mixed")))
     self.threads_spin.setValue(int(data.get("automation_threads", self.threads_spin.value())))
@@ -1930,18 +2230,10 @@ class UiMainWindow(QMainWindow):
     self.proxies_edit.setPlainText(data.get("proxies_text", ""))
     self.keywords_edit.setPlainText(data.get("keywords_text", ""))
     self.warmup_edit.setPlainText(data.get("warmup_text", ""))
-    saved_chat_html = str(data.get("ai_fix_chat_html", "") or "").strip()
-    if saved_chat_html:
-      self.ai_fix_chat.setHtml(saved_chat_html)
-      self._ai_fix_assistant_open = False
-    else:
-      self._initialize_ai_chat()
-    self._cursor_chat.restore_session(str(data.get("ai_fix_agent_id", "")))
 
   def _load_saved_settings(self) -> None:
     data = load_settings()
     if not data:
-      self._initialize_ai_chat()
       return
     try:
       self._apply_settings_dict(data)
@@ -1955,12 +2247,6 @@ class UiMainWindow(QMainWindow):
       self.append_log("[UI] Settings saved to data/settings.json")
     except Exception as exc:
       self.append_log(f"[UI] Failed to save settings: {exc}")
-
-  def _on_profile_healing_started(self, profile_id: str, status_key: str, display_text: str) -> None:
-    self._on_profile_update(profile_id, status_key, display_text)
-
-  def _on_profile_healing_finished(self, profile_id: str, status_key: str, display_text: str) -> None:
-    self._on_profile_update(profile_id, status_key, display_text)
 
   def _parse_target_domains_from_ui(self) -> list[str]:
     lines = [line.strip() for line in self.target_domains_edit.toPlainText().splitlines() if line.strip()]
@@ -1997,8 +2283,12 @@ class UiMainWindow(QMainWindow):
 
     if self.launch_min.value() > self.launch_max.value():
       raise ValueError("Launch interval min cannot exceed max.")
+    if self.session_start_delay_min.value() > self.session_start_delay_max.value():
+      raise ValueError("Session start delay min cannot exceed max.")
     if self.dwell_min.value() > self.dwell_max.value():
       raise ValueError("Dwell time min cannot exceed max.")
+    if self.internal_link_min.value() > self.internal_link_max.value():
+      raise ValueError("Internal link click min cannot exceed max.")
     if self.warmup_dwell_min.value() > self.warmup_dwell_max.value():
       raise ValueError("Warm-up dwell time min cannot exceed max.")
     if self.warmup_count_min.value() > self.warmup_count_max.value():
@@ -2009,13 +2299,15 @@ class UiMainWindow(QMainWindow):
       raise ValueError("Max search pages must be at least 1.")
     if self.max_keywords_per_profile.value() < 1:
       raise ValueError("Max keywords per profile must be at least 1.")
+    if self.failure_rate_auto_stop_percent.value() < 0:
+      raise ValueError("Failure rate auto-stop percent cannot be negative.")
+    if self.failure_rate_auto_stop_min_attempts.value() < 1:
+      raise ValueError("Failure rate auto-stop min attempts must be at least 1.")
 
     proxies: list[tuple[str, int, str, str]] = []
     if self.proxies_edit.toPlainText().strip():
       proxies = self._parse_proxies()
 
-    cursor_key = self.cursor_api_key.text().strip()
-    cursor_model = self._cursor_model_value()
     return BotConfig(
       capsolver_api_key=self.capsolver_key.text().strip(),
       adspower_api_url=self.adspower_api_url.text().strip(),
@@ -2027,8 +2319,12 @@ class UiMainWindow(QMainWindow):
       warmup_queries=warmup,
       launch_interval_min=self.launch_min.value(),
       launch_interval_max=self.launch_max.value(),
+      session_start_delay_min=self.session_start_delay_min.value(),
+      session_start_delay_max=self.session_start_delay_max.value(),
       dwell_min=self.dwell_min.value(),
       dwell_max=self.dwell_max.value(),
+      internal_link_min=self.internal_link_min.value(),
+      internal_link_max=self.internal_link_max.value(),
       warmup_dwell_min=self.warmup_dwell_min.value(),
       warmup_dwell_max=self.warmup_dwell_max.value(),
       warmup_count_min=self.warmup_count_min.value(),
@@ -2037,17 +2333,16 @@ class UiMainWindow(QMainWindow):
       action_delay_max=self.action_delay_max.value(),
       max_search_pages=self.max_search_pages.value(),
       max_keywords_per_profile=self.max_keywords_per_profile.value(),
+      failure_rate_auto_stop_percent=self.failure_rate_auto_stop_percent.value(),
+      failure_rate_auto_stop_min_attempts=self.failure_rate_auto_stop_min_attempts.value(),
       ip_check_session_start=self.chk_ip_check_session.isChecked(),
       ip_check_enabled=self.chk_ip_check_keyword2.isChecked(),
+      skip_exhausted_pairs_in_session=self.chk_skip_exhausted_pairs.isChecked(),
+      resource_blocking_enabled=self.chk_resource_blocking.isChecked(),
       automation_threads=self.threads_spin.value(),
       automation_cycles=self.cycles_spin.value(),
       profile_count=self.profile_count_spin.value(),
       profile_os_mode=self._profile_os_mode_from_ui(),
-      cursor_api_key=cursor_key,
-      cursor_model=cursor_model,
-      llm_api_key=cursor_key,
-      llm_base_url="https://api.cursor.com/v1",
-      llm_model=cursor_model,
     )
 
   @staticmethod
@@ -2272,34 +2567,69 @@ class UiMainWindow(QMainWindow):
       self.append_log(f"[UI] Profile delete failed: {exc}")
 
   def _begin_session_click_log(self, config: BotConfig) -> str:
-    path = new_session_click_log_path("data")
+    path = new_session_click_log_path(self._data_dir)
     config.session_click_log_path = str(path)
     self._session_click_log_path = str(path)
+    self._failure_rate_auto_stop_triggered = False
     SessionClickCsvLogger(path, target_domains=config.get_target_domains())
     self.append_log(f"[UI] Click log file: {path}")
     if hasattr(self, "result_session_list"):
-      QTimer.singleShot(0, self._refresh_result_file_list)
+      QTimer.singleShot(0, lambda: self._refresh_result_file_list(force=True))
     return str(path)
 
   def _reset_overall_clicks(self) -> None:
     self._overall_clicks_session = 0
-    self.overall_clicks_value_label.setText("0")
+    self.overall_clicks_value_label.setText("0 / 0")
+
+  def _refresh_overall_clicks_kpi(self) -> None:
+    path = (self._session_click_log_path or "").strip()
+    if not path:
+      self.overall_clicks_value_label.setText("0 / 0")
+      return
+    successes, failures = count_session_click_outcomes(path)
+    self._overall_clicks_session = successes
+    self.overall_clicks_value_label.setText(f"{successes} / {failures}")
+
+  def _refresh_overall_clicks(self) -> None:
+    self._refresh_overall_clicks_kpi()
+
+  def _reset_captcha_stats(self) -> None:
+    self._session_captcha_auto = 0
+    self._session_captcha_total = 0
+    if hasattr(self, "captcha_occurs_value_label"):
+      self.captcha_occurs_value_label.setText("0 / 0")
+
+  def _refresh_captcha_kpi(self) -> None:
+    if hasattr(self, "captcha_occurs_value_label"):
+      self.captcha_occurs_value_label.setText(
+        f"{self._session_captcha_auto} / {self._session_captcha_total}"
+      )
+
+  def _on_captcha_stat(self, event: str) -> None:
+    if event == "detected":
+      self._session_captcha_total += 1
+    elif event == "auto_solved":
+      self._session_captcha_auto += 1
+    else:
+      return
+    self._refresh_captcha_kpi()
 
   def _reset_session_traffic(self) -> None:
     self._session_traffic_total = 0
-    self.proxy_traffic_total_label.setText("0 B")
+    self._session_target_traffic = 0
+    self._session_other_traffic = 0
+    self.proxy_traffic_total_label.setText(self._format_traffic_total_display())
     self._controller.reset_session_traffic()
     self._profile_traffic_totals.clear()
 
   def _reset_session_log(self) -> None:
     """Truncate on-disk session logs and clear the live log panel for a fresh automation run."""
-    data_dir = self._project_root / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    self._data_dir.mkdir(parents=True, exist_ok=True)
     for name in ("session.log", "traffic_sessions.jsonl"):
       try:
-        (data_dir / name).write_text("", encoding="utf-8")
+        (self._data_dir / name).write_text("", encoding="utf-8")
       except OSError as exc:
-        self.log_view.appendPlainText(f"[UI] Could not reset {name}: {exc}")
+        self.log_view.append(f'<span style="color:#fca5a5">[UI] Could not reset {name}: {exc}</span>')
         continue
     self.log_view.clear()
 
@@ -2321,19 +2651,11 @@ class UiMainWindow(QMainWindow):
       and self._result_loaded_path.resolve() == active_path.resolve()
     ):
       self._load_result_session(active_path)
-    elif self.tabs.currentIndex() == getattr(self, "_result_tab_index", -1):
-      self._refresh_result_file_list()
-
-  def _refresh_overall_clicks(self) -> None:
-    path = (self._session_click_log_path or "").strip()
-    if not path:
-      return
-    total = SessionClickCsvLogger.count_rows(path)
-    self._overall_clicks_session = total
-    self.overall_clicks_value_label.setText(str(total))
+    elif self._current_page_index() == getattr(self, "_result_tab_index", -1):
+      self._refresh_result_file_list(force=True)
 
   def _on_result_click_logged(self) -> None:
-    if self.tabs.currentIndex() != getattr(self, "_result_tab_index", -1):
+    if self._current_page_index() != getattr(self, "_result_tab_index", -1):
       return
     current = self.result_session_list.currentItem()
     active_path = (self._session_click_log_path or "").strip()
@@ -2354,7 +2676,9 @@ class UiMainWindow(QMainWindow):
       return
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
+    self._reset_captcha_stats()
     self._reset_session_traffic()
+    self._warn_capsolver_key_missing()
     started = 0
     for profile_id in profile_ids:
       if self._controller.start_profile_manual(profile_id, config):
@@ -2420,7 +2744,6 @@ class UiMainWindow(QMainWindow):
       status_key in (
         UiStatusKey.CAPTCHA.value,
         UiStatusKey.CAPTCHA_MANUAL.value,
-        UiStatusKey.SELF_HEALING.value,
       )
     )
     item.setFont(font)
@@ -2482,6 +2805,37 @@ class UiMainWindow(QMainWindow):
     self.btn_create.setEnabled(not running)
     self.threads_spin.setEnabled(not running)
     self.cycles_spin.setEnabled(not running)
+    if running:
+      self._start_elapsed_timer()
+    else:
+      self._stop_elapsed_timer()
+
+  @staticmethod
+  def _format_elapsed_time(seconds: int) -> str:
+    total = max(0, int(seconds))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+  def _refresh_elapsed_time_label(self) -> None:
+    if hasattr(self, "elapsed_time_value_label"):
+      self.elapsed_time_value_label.setText(self._format_elapsed_time(self._elapsed_seconds))
+
+  def _reset_elapsed_time(self) -> None:
+    self._elapsed_seconds = 0
+    self._refresh_elapsed_time_label()
+
+  def _start_elapsed_timer(self) -> None:
+    if not self._elapsed_timer.isActive():
+      self._elapsed_timer.start()
+
+  def _stop_elapsed_timer(self) -> None:
+    if self._elapsed_timer.isActive():
+      self._elapsed_timer.stop()
+
+  def _tick_elapsed_time(self) -> None:
+    if not self._global_running:
+      return
+    self._elapsed_seconds += 1
+    self._refresh_elapsed_time_label()
 
   def _schedule_live_profile_refresh(self) -> None:
     if self._global_running:
@@ -2538,25 +2892,43 @@ class UiMainWindow(QMainWindow):
     )
 
   @staticmethod
-  def _format_bytes(total_bytes: int) -> str:
-    value = float(max(0, int(total_bytes)))
-    units = ("B", "KB", "MB", "GB", "TB")
-    unit_index = 0
-    while value >= 1024 and unit_index < len(units) - 1:
-      value /= 1024.0
-      unit_index += 1
-    if unit_index == 0:
-      return f"{int(value)} {units[unit_index]}"
-    return f"{value:.2f} {units[unit_index]}"
+  def _format_bytes(total_bytes: int, *, integer_units: bool = False) -> str:
+    value = max(0, int(total_bytes))
+    if value < 1024:
+      return f"{value} B"
+    kb = value / 1024.0
+    if kb < 1024.0:
+      if integer_units:
+        return f"{int(round(kb))} KB"
+      return f"{kb:.2f} KB"
+    mb = value / (1024.0 * 1024.0)
+    if integer_units:
+      return f"{int(round(mb))} MB"
+    return f"{mb:.2f} MB"
+
+  def _format_traffic_total_display(self) -> str:
+    total = self._format_bytes(self._session_traffic_total, integer_units=True)
+    target = self._format_bytes(self._session_target_traffic, integer_units=True)
+    other = self._format_bytes(self._session_other_traffic, integer_units=True)
+    return f"{total} ({target} / {other})"
 
   def _on_proxy_traffic_update(self, proxy_key: str, total_bytes: int) -> None:
     _ = proxy_key
     _ = total_bytes
 
-  def _on_profile_traffic_update(self, profile_id: str, total_bytes: int, total_all_bytes: int) -> None:
+  def _on_profile_traffic_update(
+    self,
+    profile_id: str,
+    total_bytes: int,
+    total_all_bytes: int,
+    target_all_bytes: int,
+    other_all_bytes: int,
+  ) -> None:
     self._profile_traffic_totals[profile_id] = int(total_bytes)
     self._session_traffic_total = max(self._session_traffic_total, int(total_all_bytes))
-    self.proxy_traffic_total_label.setText(self._format_bytes(self._session_traffic_total))
+    self._session_target_traffic = int(target_all_bytes)
+    self._session_other_traffic = int(other_all_bytes)
+    self.proxy_traffic_total_label.setText(self._format_traffic_total_display())
     display = self._format_bytes(total_bytes)
     row = self._find_row_for_profile(profile_id)
     if row < 0:
@@ -2572,11 +2944,42 @@ class UiMainWindow(QMainWindow):
 
   def _on_profile_finished(self, profile_id: str, outcome: str) -> None:
     _ = profile_id
-    if outcome == "not_found" and self.tabs.currentIndex() == getattr(self, "_result_tab_index", -1):
-      current = self.result_session_list.currentItem()
-      active_path = (self._session_click_log_path or "").strip()
-      if current and active_path and str(current.data(Qt.ItemDataRole.UserRole) or "") == str(Path(active_path).resolve()):
-        self._load_result_session(Path(active_path))
+    _ = outcome
+    self._refresh_overall_clicks_kpi()
+    self._check_auto_stop_on_failure_rate()
+    if self._current_page_index() != getattr(self, "_result_tab_index", -1):
+      return
+    current = self.result_session_list.currentItem()
+    active_path = (self._session_click_log_path or "").strip()
+    if current and active_path and str(current.data(Qt.ItemDataRole.UserRole) or "") == str(Path(active_path).resolve()):
+      self._load_result_session(Path(active_path))
+
+  def _check_auto_stop_on_failure_rate(self) -> None:
+    if not self._global_running or self._failure_rate_auto_stop_triggered:
+      return
+    threshold_percent = int(self.failure_rate_auto_stop_percent.value())
+    if threshold_percent <= 0:
+      return
+    min_attempts = int(self.failure_rate_auto_stop_min_attempts.value())
+    path = (self._session_click_log_path or "").strip()
+    if not path:
+      return
+    successes, failures = count_session_click_outcomes(path)
+    total = successes + failures
+    if not should_auto_stop_on_failure_rate(
+      successes,
+      failures,
+      threshold_percent=threshold_percent,
+      min_attempts=min_attempts,
+    ):
+      return
+    failure_rate = failures / total if total else 0.0
+    self._failure_rate_auto_stop_triggered = True
+    self.append_log(
+      f"[UI] Session failure rate {failures}/{total} ({failure_rate * 100:.0f}%) "
+      f"exceeds {threshold_percent}% with {total} attempts — stopping automation."
+    )
+    self.on_stop_automated()
 
   def on_create_profiles(self) -> None:
     try:
@@ -2671,10 +3074,13 @@ class UiMainWindow(QMainWindow):
     config.automation_threads = self.threads_spin.value()
     config.automation_cycles = self.cycles_spin.value()
     self.present_cycle_value_label.setText(f"0 / {config.automation_cycles}")
+    self._reset_elapsed_time()
     self._reset_session_log()
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
+    self._reset_captcha_stats()
     self._reset_session_traffic()
+    self._warn_capsolver_key_missing()
     cleared = self._controller.clear_keyword_exclusions(config.target_domain)
     if cleared:
       self.append_log(
@@ -2693,12 +3099,14 @@ class UiMainWindow(QMainWindow):
         f"[UI] Auto-create automation started: threads={config.automation_threads}, "
         f"cycles={config.automation_cycles}, "
         f"launch interval {config.launch_interval_min}-{config.launch_interval_max}s, "
+        f"session start delay {config.session_start_delay_min}-{config.session_start_delay_max}s, "
         f"profile OS mode={config.profile_os_mode}."
       )
     else:
       self.append_log("[UI] Global bot is already running.")
 
   def on_stop_automated(self) -> None:
+    self._stop_elapsed_timer()
     self._controller.stop_global()
 
   def _on_global_finished(self) -> None:
@@ -2721,7 +3129,9 @@ class UiMainWindow(QMainWindow):
       return
     self._begin_session_click_log(config)
     self._reset_overall_clicks()
+    self._reset_captcha_stats()
     self._reset_session_traffic()
+    self._warn_capsolver_key_missing()
     self._controller.start_profile_manual(profile_id, config)
 
   def _on_row_pause(self, profile_id: str) -> None:
@@ -2734,12 +3144,4 @@ class UiMainWindow(QMainWindow):
     self._delete_profiles([profile_id])
 
   def closeEvent(self, event) -> None:
-    try:
-      self._persist_ai_chat_state()
-    except Exception:
-      pass
-    try:
-      self._cursor_chat.shutdown()
-    except Exception:
-      pass
     super().closeEvent(event)

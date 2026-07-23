@@ -11,7 +11,6 @@ class UiStatusKey(str, Enum):
   CAPTCHA = "captcha"
   CAPTCHA_MANUAL = "captcha_manual"
   ERROR = "error"
-  SELF_HEALING = "self_healing"
   CLOSED = "closed"
 
 
@@ -25,7 +24,6 @@ UI_STATUS_LABELS: dict[UiStatusKey, str] = {
   UiStatusKey.CAPTCHA: "Solving Captcha",
   UiStatusKey.CAPTCHA_MANUAL: "Captcha (Manual)",
   UiStatusKey.ERROR: "Error",
-  UiStatusKey.SELF_HEALING: "Self-Healing",
   UiStatusKey.CLOSED: "Offline",
 }
 
@@ -37,7 +35,6 @@ SESSION_ELAPSED_KEYS = frozenset({
   UiStatusKey.WARMING_UP.value,
   UiStatusKey.SEARCHING.value,
   UiStatusKey.VISITING_SITE.value,
-  UiStatusKey.SELF_HEALING.value,
 })
 
 CAPTCHA_ELAPSED_KEYS = frozenset({
@@ -50,6 +47,13 @@ ERROR_ELAPSED_KEYS = frozenset({
 })
 
 ELAPSED_STATUS_KEYS = SESSION_ELAPSED_KEYS | CAPTCHA_ELAPSED_KEYS | ERROR_ELAPSED_KEYS
+
+
+_STATUS_SHORT_NAMES: dict[UiStatusKey, str] = {
+  UiStatusKey.WARMING_UP: "Warmup",
+  UiStatusKey.SEARCHING: "Searching",
+  UiStatusKey.VISITING_SITE: "Visiting",
+}
 
 
 def ui_label(key: UiStatusKey) -> str:
@@ -86,7 +90,6 @@ class ProfileStatus(str, Enum):
   BLOCKED = "blocked"
   COOLDOWN = "cooldown"
   STOPPED = "stopped"
-  SELF_HEALING = "self_healing"
 
   def to_ui(self, cooldown_seconds: int = 0, detail: str = "") -> tuple[str, str]:
     if self == ProfileStatus.CREATING_PROFILE:
@@ -96,17 +99,15 @@ class ProfileStatus(str, Enum):
     if self == ProfileStatus.CHECKING_IP:
       return self._pair(UiStatusKey.CHECKING_IP)
     if self == ProfileStatus.WARMING_UP:
-      return self._pair(UiStatusKey.WARMING_UP)
+      return self._pair_with_detail(UiStatusKey.WARMING_UP, detail)
     if self == ProfileStatus.SEARCHING:
-      return self._pair(UiStatusKey.SEARCHING)
+      return self._pair_with_detail(UiStatusKey.SEARCHING, detail)
     if self in (ProfileStatus.VISITING_SITE, ProfileStatus.SUCCESS):
-      return self._pair(UiStatusKey.VISITING_SITE)
+      return self._pair_with_detail(UiStatusKey.VISITING_SITE, detail)
     if self == ProfileStatus.CAPTCHA_WAIT:
       return self._pair(UiStatusKey.CAPTCHA)
     if self == ProfileStatus.CAPTCHA_MANUAL:
       return self._pair(UiStatusKey.CAPTCHA_MANUAL)
-    if self == ProfileStatus.SELF_HEALING:
-      return self._pair(UiStatusKey.SELF_HEALING)
     if self in (ProfileStatus.ERROR, ProfileStatus.BLOCKED):
       label = ui_label(UiStatusKey.ERROR)
       if detail:
@@ -122,3 +123,11 @@ class ProfileStatus(str, Enum):
   def _pair(key: UiStatusKey) -> tuple[str, str]:
     label = ui_label(key)
     return key.value, label
+
+  @staticmethod
+  def _pair_with_detail(key: UiStatusKey, detail: str = "") -> tuple[str, str]:
+    text = (detail or "").strip()
+    if text:
+      short = _STATUS_SHORT_NAMES.get(key, ui_label(key).split()[0])
+      return key.value, f"{short}({text})"
+    return ProfileStatus._pair(key)

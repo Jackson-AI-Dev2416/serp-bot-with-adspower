@@ -2,18 +2,24 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-SETTINGS_PATH = Path("data/settings.json")
+from utils.app_paths import data_dir
+
+
+def settings_path() -> Path:
+  return data_dir() / "settings.json"
 
 
 def save_settings(data: dict[str, Any]) -> None:
-  SETTINGS_PATH.parent.mkdir(exist_ok=True)
-  SETTINGS_PATH.write_text(
+  path = settings_path()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(
     json.dumps(data, ensure_ascii=False, indent=2),
     encoding="utf-8",
   )
 
 
 def load_settings() -> Optional[dict[str, Any]]:
-  if not SETTINGS_PATH.exists():
+  path = settings_path()
+  if not path.exists():
     return None
-  return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+  return json.loads(path.read_text(encoding="utf-8"))

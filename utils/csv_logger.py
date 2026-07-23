@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Optional, TypedDict
 from urllib.parse import urlparse
 
+from utils.app_paths import data_dir as resolve_data_dir
+
 _SESSION_META_MARKER = "#meta"
 
 
@@ -14,8 +16,11 @@ class KeywordClickSummary(TypedDict):
     total: int
     windows: int
     mobile: int
+    not_found: int
 
 _RESULT_FILENAME_RE = re.compile(r"^result_(\d{8})_(\d{6})\.csv$", re.IGNORECASE)
+
+SESSION_FAILURE_URL_LABELS = frozenset({"not found", "failed", "error", "blocked"})
 
 # Excel on Windows opens CSV as ANSI/CP949 unless a UTF-8 BOM is present.
 _CSV_ENCODING = "utf-8-sig"
@@ -36,13 +41,92 @@ def _ensure_csv_utf8_bom(filepath: Path) -> None:
         return
 
 
-def new_session_click_log_path(data_dir: str | Path = "data") -> Path:
+def new_session_click_log_path(data_dir: str | Path | None = None) -> Path:
+    root = Path(data_dir) if data_dir is not None else resolve_data_dir()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path(data_dir) / f"result_{stamp}.csv"
+    return root / f"result_{stamp}.csv"
+
+
+def outcome_to_failure_url(outcome: str) -> Optional[str]:
+    normalized = (outcome or "").strip().lower()
+    if normalized == "not_found":
+        return "not found"
+    if normalized == "failed":
+        return "failed"
+    if normalized == "blocked":
+        return "blocked"
+    if normalized in ("error", "ip_changed", "ip_unavailable", "tunnel_error", "proxy_connect_failed"):
+        return "error"
+    return None
+
+
+def is_session_failure_row(headers: list[str], row: list[str]) -> bool:
+    url_idx = _header_index(headers, "url")
+    if url_idx < 0:
+        return False
+    url = (row[url_idx] if url_idx < len(row) else "").strip().lower()
+    return url in SESSION_FAILURE_URL_LABELS
+
+
+def count_session_click_outcomes(filepath: str | Path) -> tuple[int, int]:
+    """Return (success_click_count, failure_count) for a session result CSV."""
+    headers, rows, _meta = read_session_click_file(filepath)
+    successes = 0
+    failures = 0
+    for row in rows:
+        if is_session_failure_row(headers, row):
+            failures += 1
+        else:
+            successes += 1
+    return successes, failures
+
+
+def should_auto_stop_on_failure_rate(
+    successes: int,
+    failures: int,
+    *,
+    threshold_percent: int,
+    min_attempts: int,
+) -> bool:
+    """Return True when failures/total exceeds threshold_percent after min_attempts."""
+    if threshold_percent <= 0:
+        return False
+    total = max(0, int(successes)) + max(0, int(failures))
+    if total < max(1, int(min_attempts)):
+        return False
+    return (failures / total) > (threshold_percent / 100.0)
+
+
+def log_session_failure(
+    filepath: str | Path,
+    *,
+    profile_name: str,
+    device: str,
+    keyword: str,
+    site: str,
+    failure_url: str,
+) -> None:
+    SessionClickCsvLogger(filepath).log_failure(
+        profile_name=profile_name,
+        device=device,
+        keyword=keyword,
+        site=site,
+        failure_url=failure_url,
+    )
 
 
 class SessionClickCsvLogger:
-    _HEADERS = ("datetime", "profile_name", "device", "keyword", "url", "page", "rank", "overall_rank")
+    _HEADERS = (
+        "datetime",
+        "profile_name",
+        "device",
+        "keyword",
+        "url",
+        "page",
+        "rank",
+        "overall_rank",
+        "site",
+    )
     _PATH_LOCKS: dict[str, threading.Lock] = {}
 
     def __init__(self, filepath: str | Path, *, target_domains: list[str] | None = None):
@@ -145,6 +229,7 @@ class SessionClickCsvLogger:
         page: int,
         rank: int,
         overall_rank: int,
+        site: str = "",
     ) -> None:
         row = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -155,15 +240,49 @@ class SessionClickCsvLogger:
             page,
             rank,
             overall_rank,
+            (site or "").strip(),
         )
         with self._lock:
-            with self.filepath.open("a", newline="", encoding=_CSV_ENCODING) as handle:
-                csv.writer(handle).writerow(row)
+            try:
+                with self.filepath.open("a", newline="", encoding=_CSV_ENCODING) as handle:
+                    csv.writer(handle).writerow(row)
+            except PermissionError:
+                pass
+
+    def log_failure(
+        self,
+        *,
+        profile_name: str,
+        device: str,
+        keyword: str,
+        site: str,
+        failure_url: str,
+    ) -> None:
+        label = (failure_url or "").strip().lower()
+        if label not in SESSION_FAILURE_URL_LABELS:
+            return
+        row = (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            profile_name,
+            (device or "").strip() or "Unknown",
+            keyword,
+            label,
+            "",
+            "",
+            "",
+            (site or "").strip(),
+        )
+        with self._lock:
+            try:
+                with self.filepath.open("a", newline="", encoding=_CSV_ENCODING) as handle:
+                    csv.writer(handle).writerow(row)
+            except PermissionError:
+                pass
 
     @staticmethod
     def count_rows(filepath: str | Path) -> int:
-        _headers, rows, _meta = read_session_click_file(filepath)
-        return len(rows)
+        successes, _failures = count_session_click_outcomes(filepath)
+        return successes
 
     @staticmethod
     def read_rows(filepath: str | Path) -> tuple[list[str], list[list[str]]]:
@@ -279,10 +398,25 @@ def session_target_domains(
     return domains
 
 
+def _row_target_site(headers: list[str], row: list[str]) -> str:
+    site_idx = _header_index(headers, "site")
+    if site_idx >= 0 and site_idx < len(row):
+        site = (row[site_idx] or "").strip()
+        if site:
+            return site
+    url_idx = _header_index(headers, "url")
+    if url_idx < 0 or is_session_failure_row(headers, row):
+        return ""
+    url = (row[url_idx] if url_idx < len(row) else "").strip()
+    return _normalize_host(urlparse(url).netloc or url)
+
+
 def filter_click_rows_by_domain(
     headers: list[str],
     rows: list[list[str]],
     domain: str,
+    *,
+    meta: dict[str, str] | None = None,
 ) -> list[list[str]]:
     cleaned = (domain or "").strip()
     if not cleaned or cleaned.lower() == "all":
@@ -290,26 +424,40 @@ def filter_click_rows_by_domain(
     url_idx = _header_index(headers, "url")
     if url_idx < 0:
         return list(rows)
-    return [
-        row
-        for row in rows
-        if url_matches_target_domain(row[url_idx] if url_idx < len(row) else "", cleaned)
-    ]
+    session_domains = []
+    if meta:
+        raw = (meta.get("target_domains") or "").strip()
+        if raw:
+            session_domains = [part.strip() for part in raw.split("|") if part.strip()]
+    single_domain_session = len(session_domains) == 1
+    filtered: list[list[str]] = []
+    for row in rows:
+        if is_session_failure_row(headers, row):
+            site = _row_target_site(headers, row)
+            if site and url_matches_target_domain(f"https://{site}", cleaned):
+                filtered.append(row)
+            elif not site and single_domain_session and url_matches_target_domain(
+                f"https://{session_domains[0]}",
+                cleaned,
+            ):
+                filtered.append(row)
+            continue
+        if url_matches_target_domain(row[url_idx] if url_idx < len(row) else "", cleaned):
+            filtered.append(row)
+    return filtered
 
 
 def aggregate_keyword_clicks_for_domain(
     headers: list[str],
     rows: list[list[str]],
     domain: str,
+    *,
+    meta: dict[str, str] | None = None,
 ) -> list[KeywordClickSummary]:
     url_idx = _header_index(headers, "url")
     if url_idx < 0:
         return aggregate_keyword_clicks(headers, rows)
-    filtered = [
-        row
-        for row in rows
-        if url_matches_target_domain(row[url_idx] if url_idx < len(row) else "", domain)
-    ]
+    filtered = filter_click_rows_by_domain(headers, rows, domain, meta=meta)
     return aggregate_keyword_clicks(headers, filtered)
 
 
@@ -325,7 +473,13 @@ def aggregate_keyword_clicks(headers: list[str], rows: list[list[str]]) -> list[
         if not keyword:
             continue
         device = (row[device_idx] if device_idx >= 0 and device_idx < len(row) else "").strip()
-        bucket = totals.setdefault(keyword, {"total": 0, "windows": 0, "mobile": 0})
+        bucket = totals.setdefault(
+            keyword,
+            {"total": 0, "windows": 0, "mobile": 0, "not_found": 0},
+        )
+        if is_session_failure_row(headers, row):
+            bucket["not_found"] += 1
+            continue
         bucket["total"] += 1
         if _is_windows_device(device):
             bucket["windows"] += 1
@@ -338,6 +492,7 @@ def aggregate_keyword_clicks(headers: list[str], rows: list[list[str]]) -> list[
             "total": counts["total"],
             "windows": counts["windows"],
             "mobile": counts["mobile"],
+            "not_found": counts["not_found"],
         }
         for keyword, counts in totals.items()
     ]
@@ -362,8 +517,8 @@ def format_result_session_label(filepath: str | Path) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def list_session_result_files(data_dir: str | Path = "data") -> list[Path]:
-    root = Path(data_dir)
+def list_session_result_files(data_dir: str | Path | None = None) -> list[Path]:
+    root = Path(data_dir) if data_dir is not None else resolve_data_dir()
     if not root.exists():
         return []
     files = [path for path in root.glob("result_*.csv") if _RESULT_FILENAME_RE.match(path.name)]
@@ -397,9 +552,9 @@ def count_target_not_found_in_session(
     session_start: datetime,
     session_end_exclusive: Optional[datetime] = None,
     *,
-    session_log_path: str | Path = "data/session.log",
+    session_log_path: str | Path | None = None,
 ) -> int:
-    log_path = Path(session_log_path)
+    log_path = Path(session_log_path) if session_log_path is not None else resolve_data_dir() / "session.log"
     if not log_path.exists():
         return 0
     count = 0
@@ -436,7 +591,7 @@ class CsvRankLogger:
             except PermissionError:
                 pass
 
-    def log(self, keyword: str, target_domain: str, page: int, rank: int, profile_name: str) -> None:
+    def log(self, keyword: str, target_domain: str, page: int, rank: int, profile_name: str) -> bool:
         row = (
             datetime.now(timezone.utc).isoformat(),
             keyword,
@@ -446,8 +601,12 @@ class CsvRankLogger:
             profile_name,
         )
         with self._lock:
-            with self.filepath.open("a", newline="", encoding=_CSV_ENCODING) as f:
-                csv.writer(f).writerow(row)
+            try:
+                with self.filepath.open("a", newline="", encoding=_CSV_ENCODING) as f:
+                    csv.writer(f).writerow(row)
+                return True
+            except PermissionError:
+                return False
 
     def count_clicks(self, target_domain: str | None = None) -> int:
         if not self.filepath.exists():
@@ -523,9 +682,9 @@ class KeywordHistoryLogger:
             return page <= 2
         return page >= 3 and page <= max(1, int(max_pages))
 
-    def __init__(self, target_domain: str, data_dir: str | Path = "data"):
+    def __init__(self, target_domain: str, data_dir: str | Path | None = None):
         self.target_domain = (target_domain or "").strip()
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir) if data_dir is not None else resolve_data_dir()
         domain_key = self._domain_key(self.target_domain)
         filename = f"{domain_key}_last_keyword.csv"
         self.filepath = self.data_dir / filename

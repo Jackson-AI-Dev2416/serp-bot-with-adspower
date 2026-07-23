@@ -4,8 +4,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-CRASH_REPORT_PATH = Path("data/crash_report.json")
-HTML_SNAPSHOT_PATH = Path("data/crash_page.html")
+from utils.app_paths import data_dir
+
+
+def crash_report_path() -> Path:
+  return data_dir() / "crash_report.json"
+
+
+def html_snapshot_path() -> Path:
+  return data_dir() / "crash_page.html"
 
 
 def write_crash_report(
@@ -20,10 +27,12 @@ def write_crash_report(
   target_file: str = "services/serp_bot.py",
   extra: Optional[dict[str, Any]] = None,
 ) -> Path:
-  CRASH_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+  report_path = crash_report_path()
+  snapshot_path = html_snapshot_path()
+  report_path.parent.mkdir(parents=True, exist_ok=True)
 
   if page_html:
-    HTML_SNAPSHOT_PATH.write_text(page_html, encoding="utf-8")
+    snapshot_path.write_text(page_html, encoding="utf-8")
 
   payload = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -33,12 +42,12 @@ def write_crash_report(
     "error_type": error_type,
     "error_message": error_message,
     "traceback": tb,
-    "page_html_path": str(HTML_SNAPSHOT_PATH) if page_html else "",
+    "page_html_path": str(snapshot_path) if page_html else "",
     "target_file": target_file,
     "extra": extra or {},
   }
-  CRASH_REPORT_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-  return CRASH_REPORT_PATH
+  report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+  return report_path
 
 
 def capture_exception(

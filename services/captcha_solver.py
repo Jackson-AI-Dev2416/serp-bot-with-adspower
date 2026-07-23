@@ -2,7 +2,6 @@ import json
 import random
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
@@ -10,16 +9,19 @@ import httpx
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from core.profile_status import UiStatusKey, ui_label
+from config.settings_store import settings_path
+from utils.app_paths import data_dir
 
 StatusNotify = Callable[[str, str], None]
+CaptchaStatCallback = Callable[[str], None]
 ClearedNotify = Callable[[], None]
-SETTINGS_PATH = Path("data/settings.json")
-CAPTCHA_EVENTS_PATH = Path("data/captcha_events.jsonl")
 
 
 class CaptchaSolver:
   CREATE_URL = "https://api.capsolver.com/createTask"
   RESULT_URL = "https://api.capsolver.com/getTaskResult"
+  MANUAL_CAPTCHA_TIMEOUT_SEC = 60.0
+  MAX_AUTOMATED_SOLVE_ATTEMPTS = 3
 
   def __init__(self, api_key: str, logger: Callable[[str], None]):
     self.api_key = self._normalize_api_key(api_key)
@@ -33,6 +35,22 @@ class CaptchaSolver:
     self._awaiting_clear = False
     self._session_logger: Optional[Callable[[str], None]] = None
     self._session_context: dict[str, str] = {}
+    self._proxy_capsolver: str = ""
+    self._proxy_capsolver_unusable: bool = False
+    self._last_api_error: str = ""
+    self._stats_callback: Optional[CaptchaStatCallback] = None
+    self._automated_attempts: int = 0
+
+  def set_stats_callback(self, callback: Optional[CaptchaStatCallback]) -> None:
+    self._stats_callback = callback
+
+  def _notify_stats(self, event: str) -> None:
+    if event not in ("detected", "auto_solved") or not self._stats_callback:
+      return
+    try:
+      self._stats_callback(event)
+    except Exception:
+      pass
 
   def set_session_context(
     self,
@@ -41,6 +59,10 @@ class CaptchaSolver:
     profile_name: str = "",
     proxy: str = "",
     keyword: str = "",
+    proxy_host: str = "",
+    proxy_port: int = 0,
+    proxy_user: str = "",
+    proxy_pass: str = "",
   ) -> None:
     self._session_context = {
       "profile_id": profile_id,
@@ -48,6 +70,25 @@ class CaptchaSolver:
       "proxy": proxy,
       "keyword": keyword,
     }
+    self._proxy_capsolver = self._format_capsolver_proxy(
+      proxy_host, proxy_port, proxy_user, proxy_pass,
+    )
+
+  @staticmethod
+  def _format_capsolver_proxy(
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+  ) -> str:
+    host = (host or "").strip()
+    if not host or host in ("—", "-") or int(port or 0) <= 0:
+      return ""
+    user = (user or "").strip()
+    password = (password or "").strip()
+    if user and password:
+      return f"http:{host}:{int(port)}:{user}:{password}"
+    return f"http:{host}:{int(port)}"
 
   def update_keyword_context(self, keyword: str) -> None:
     self._session_context["keyword"] = keyword or ""
@@ -63,11 +104,13 @@ class CaptchaSolver:
       "captcha_type": captcha_type,
     }
     try:
-      CAPTCHA_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-      with CAPTCHA_EVENTS_PATH.open("a", encoding="utf-8") as handle:
+      events_path = data_dir() / "captcha_events.jsonl"
+      events_path.parent.mkdir(parents=True, exist_ok=True)
+      with events_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
       pass
+    self._notify_stats(event)
     self._log(
       f"[Captcha] Event={event} profile={payload['profile_id']} "
       f"proxy={payload['proxy']} keyword={payload['keyword']} type={captcha_type or 'unknown'}"
@@ -84,6 +127,9 @@ class CaptchaSolver:
 
   def reset_session_state(self) -> None:
     self._awaiting_clear = False
+    self._last_api_error = ""
+    self._proxy_capsolver_unusable = False
+    self._automated_attempts = 0
 
   def is_awaiting_clear(self) -> bool:
     return self._awaiting_clear
@@ -129,9 +175,10 @@ class CaptchaSolver:
   @staticmethod
   def _load_key_from_settings() -> str:
     try:
-      if not SETTINGS_PATH.exists():
+      path = settings_path()
+      if not path.exists():
         return ""
-      data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+      data = json.loads(path.read_text(encoding="utf-8"))
       return (data.get("capsolver_api_key") or "").strip()
     except Exception:
       return ""
@@ -158,6 +205,41 @@ class CaptchaSolver:
       or "FRAME WAS DETACHED" in text
     )
 
+  def _announce_captcha_detected(
+    self,
+    page: Page,
+    on_status: Optional[StatusNotify],
+    *,
+    captcha_type: str = "",
+  ) -> str:
+    self._awaiting_clear = True
+    self._log("[Captcha] 1. CAPTCHA DETECTED — workflow paused until solved (WAIT_CAPTCHA)")
+    if on_status:
+      try:
+        on_status(UiStatusKey.CAPTCHA.value, ui_label(UiStatusKey.CAPTCHA))
+      except Exception as status_exc:
+        self._log(f"[Captcha] UI status update warning (continuing solve): {status_exc}")
+    detected_type = captcha_type or self._detect_captcha_type(page)
+    self._log_captcha_event("detected", detected_type)
+    return detected_type
+
+  def _captcha_still_blocking(self, page: Page) -> bool:
+    if page.is_closed():
+      return self._awaiting_clear
+    return self._page_needs_captcha_clear(page)
+
+  def _handle_no_api_key_captcha(
+    self,
+    page: Page,
+    on_status: Optional[StatusNotify],
+    *,
+    captcha_type: str = "",
+  ) -> str:
+    if not self._awaiting_clear:
+      self._announce_captcha_detected(page, on_status, captcha_type=captcha_type)
+    self._log("[Captcha] No CapSolver API key configured — removing profile")
+    return "blocked"
+
   def handle_before_action(
     self,
     page: Page,
@@ -170,51 +252,85 @@ class CaptchaSolver:
     """
     Returns: 'ok' | 'stopped' | 'error' | 'blocked'
     """
+    if stop_event and stop_event.is_set():
+      return "stopped"
+
     if page.is_closed():
       if self._awaiting_clear:
-        self._log("[Captcha] Work tab closed while captcha pending — waiting until solved")
-        return self._wait_manual_resolution(page, stop_event, on_status)
+        self._log("[Captcha] Work tab closed while captcha pending — removing profile")
+        return "blocked"
       return "ok"
     try:
       captcha_present = self._is_captcha_present(page)
     except Exception as exc:
       if self._is_page_closed_error(exc):
         if self._awaiting_clear:
-          self._log("[Captcha] Work tab closed during captcha check — waiting until solved")
-          return self._wait_manual_resolution(page, stop_event, on_status)
+          self._log("[Captcha] Work tab closed during captcha check — removing profile")
+          return "blocked"
         return "ok"
       raise
     if not captcha_present and not self._awaiting_clear:
       return "ok"
-    self._awaiting_clear = True
-    self._log("[Captcha] 1. CAPTCHA DETECTED — workflow paused until solved (WAIT_CAPTCHA)")
-    if on_status:
-      try:
-        on_status(UiStatusKey.CAPTCHA.value, ui_label(UiStatusKey.CAPTCHA))
-      except Exception as status_exc:
-        self._log(f"[Captcha] UI status update warning (continuing solve): {status_exc}")
-    detected_type = captcha_type or self._detect_captcha_type(page)
-    self._log_captcha_event("detected", detected_type)
 
-    if self.automated_mode:
-      self.logger(f"[CapSolver] Using API key {self._mask_api_key()}")
+    if not self.automated_mode:
+      return self._handle_no_api_key_captcha(
+        page, on_status, captcha_type=captcha_type,
+      )
+
+    self.logger(f"[CapSolver] Using API key {self._mask_api_key()}")
+    detected_type = captcha_type
+
+    while self._captcha_still_blocking(page):
+      if stop_event and stop_event.is_set():
+        return "stopped"
+      if page.is_closed():
+        self._log("[Captcha] Work tab closed during CapSolver flow — removing profile")
+        return "blocked"
+      if self._automated_attempts >= self.MAX_AUTOMATED_SOLVE_ATTEMPTS:
+        self._log(
+          f"[Captcha] CapSolver attempt limit reached "
+          f"({self.MAX_AUTOMATED_SOLVE_ATTEMPTS}/{self.MAX_AUTOMATED_SOLVE_ATTEMPTS}) "
+          "— removing profile"
+        )
+        return "blocked"
+
+      if not self._awaiting_clear:
+        detected_type = self._announce_captcha_detected(
+          page, on_status, captcha_type=captcha_type,
+        )
+      else:
+        self._log("[Captcha] Captcha still present — retrying CapSolver")
+
+      self._automated_attempts += 1
+      self._log(
+        f"[Captcha] CapSolver attempt "
+        f"{self._automated_attempts}/{self.MAX_AUTOMATED_SOLVE_ATTEMPTS}"
+      )
       result = self._solve_automated(page, on_status, detected_type)
-      if result in ("blocked", "error"):
-        self._log("[Captcha] Auto solve unresolved -> waiting for manual resolution")
-        result = self._wait_manual_resolution(page, stop_event, on_status, detected_type)
       if result == "ok":
         self._notify_captcha_cleared(on_cleared)
         self._awaiting_clear = False
         page = self._refresh_page_after_captcha(page)
-      return result
+        if not self._captcha_still_blocking(page):
+          return "ok"
+        self._log("[Captcha] Captcha reappeared after solve — retrying CapSolver")
+        captcha_type = ""
+        continue
 
-    self.logger("[CapSolver] No API key configured — manual captcha mode")
-    result = self._wait_manual_resolution(page, stop_event, on_status, detected_type)
-    if result == "ok":
-      self._notify_captcha_cleared(on_cleared)
-      self._awaiting_clear = False
-      page = self._refresh_page_after_captcha(page)
-    return result
+      if result == "stopped":
+        return "stopped"
+
+      self._log(
+        f"[Captcha] CapSolver attempt {self._automated_attempts} failed "
+        f"({self._last_api_error or 'captcha not cleared'})"
+      )
+      if self._automated_attempts >= self.MAX_AUTOMATED_SOLVE_ATTEMPTS:
+        self._log("[Captcha] CapSolver attempts exhausted — removing profile")
+        return "blocked"
+      time.sleep(random.uniform(1.0, 2.0))
+
+    self._awaiting_clear = False
+    return "ok"
 
   @staticmethod
   def _notify_captcha_cleared(on_cleared: Optional[ClearedNotify]) -> None:
@@ -299,6 +415,32 @@ class CaptchaSolver:
           return true;
         }
 
+        const onNormalSerp = url.includes('/search') && !url.includes('/sorry');
+        if (onNormalSerp) {
+          const hasSearchResults = !!(
+            document.querySelector('#rso a h3, div#search a h3, #rso div[data-hveid], div#center_col div[data-hveid]')
+          );
+          if (hasSearchResults) {
+            const challenge = document.querySelector('iframe[src*="bframe"], iframe[title*="challenge" i]');
+            if (isVisible(challenge)) return true;
+            const captchaForm = document.querySelector('#captcha-form, form#captcha-form');
+            if (isVisible(captchaForm)) return true;
+            const text = (document.body?.innerText || '').toLowerCase();
+            const blockingPhrases = [
+              'i am not a robot',
+              'unusual traffic',
+              'verify you are human',
+              'our systems have detected',
+              '자동화된 트래픽',
+              '비정상적인 트래픽',
+              '비정상 트래픽',
+              '로봇이 아닙니다',
+            ];
+            if (blockingPhrases.some((phrase) => text.includes(phrase))) return true;
+            return false;
+          }
+        }
+
         const title = (document.title || '').toLowerCase();
         if (
           title.includes('unusual traffic') || title.includes('automated queries') ||
@@ -346,7 +488,6 @@ class CaptchaSolver:
           'unusual traffic',
           'verify you are human',
           'our systems have detected',
-          'captcha',
           '자동화된 트래픽',
           '비정상적인 트래픽',
           '비정상 트래픽',
@@ -397,8 +538,8 @@ class CaptchaSolver:
         if (isVisible(challenge)) return false;
         if (isVisible(widget)) return false;
         if (isVisible(captchaForm)) return false;
-        if (widget && widget.getAttribute('data-sitekey')) return false;
-        if (captchaForm) return false;
+
+        if (url.includes('/search') && !url.includes('/sorry')) return true;
 
         const organic = document.querySelector('#rso a h3, div#search a h3, a:has(h3)');
         if (organic) return true;
@@ -407,6 +548,10 @@ class CaptchaSolver:
           document.querySelector('#rso div[data-hveid], div#center_col div[data-hveid]')
         );
         if (hasSearchResults) return true;
+
+        if (url.includes('google.') && !url.includes('/sorry')) {
+          return true;
+        }
 
         const response = document.querySelector('#g-recaptcha-response')
           || document.querySelector('textarea[name="g-recaptcha-response"]');
@@ -436,6 +581,13 @@ class CaptchaSolver:
     """Reload page after captcha solve so DOM/locators are fresh."""
     if page.is_closed():
       return page
+    try:
+      if self._is_captcha_cleared(page):
+        self._log("[Captcha] Page already clear after solve — skipping reload")
+        self._log_captcha_event("solved", self._detect_captcha_type(page))
+        return page
+    except Exception:
+      pass
     self._log("[Captcha] Reloading page after solve (fresh DOM, no stale locators)")
     try:
       page.reload(wait_until="domcontentloaded", timeout=60000)
@@ -443,9 +595,7 @@ class CaptchaSolver:
       self._log(f"[Captcha] Reload warning: {exc}")
       return page
     try:
-      page.wait_for_load_state("networkidle", timeout=30000)
-    except PlaywrightTimeoutError:
-      self._log("[Captcha] networkidle timeout after reload — continuing with domcontentloaded")
+      page.wait_for_timeout(400)
     except Exception as exc:
       self._log(f"[Captcha] Load-state wait warning: {exc}")
     self._log_captcha_event("solved", self._detect_captcha_type(page))
@@ -455,16 +605,19 @@ class CaptchaSolver:
     if on_status:
       on_status(UiStatusKey.CAPTCHA.value, ui_label(UiStatusKey.CAPTCHA))
 
-    sitekey, task_type, enterprise_s, callback_name, is_google = self._wait_for_captcha_meta(page)
+    sitekey, task_type, enterprise_s, callback_name, is_google = self._wait_for_captcha_meta(
+      page, timeout_sec=6.0,
+    )
     if not sitekey:
       self.logger("[CapSolver] Captcha detected but sitekey not found after waiting")
       return "error"
 
     resolved_type = captcha_type or task_type
 
-    page_url = self._normalize_website_url(page.url, is_google=is_google)
+    raw_url = (page.url or "").strip().split("#", 1)[0]
+    page_url = self._normalize_website_url(raw_url, is_google=is_google)
     self.logger(
-      f"[CapSolver] Automated solve ({task_type}, sitekey={sitekey[:12]}..., url={page_url}"
+      f"[CapSolver] Automated solve ({task_type}, sitekey={sitekey}, url={page_url}"
       + (", data-s present)" if enterprise_s else ")")
     )
     if is_google and not enterprise_s:
@@ -480,10 +633,12 @@ class CaptchaSolver:
       enterprise_s=enterprise_s,
       is_google=is_google,
       timeout=remaining,
+      raw_page_url=raw_url,
     )
     if not token:
-      self.logger("[CapSolver] Failed to obtain token within solve window")
-      self._log("[Captcha] 3. CAPTCHA SOLVE FAILED")
+      detail = self._last_api_error or "no token from CapSolver"
+      self.logger(f"[CapSolver] Failed to obtain token within solve window ({detail})")
+      self._log(f"[Captcha] 3. CAPTCHA SOLVE FAILED ({detail})")
       return "blocked"
 
     self.logger("[CapSolver] Applying token to browser page")
@@ -641,14 +796,30 @@ class CaptchaSolver:
       on_status(UiStatusKey.CAPTCHA_MANUAL.value, ui_label(UiStatusKey.CAPTCHA_MANUAL))
     self._log("[Captcha] 2. CAPTCHA SOLVE REQUEST: MANUAL")
 
-    self._log("[Captcha] Manual mode — waiting until captcha is solved (do not close the tab)")
+    self._log(
+      f"[Captcha] Manual mode — waiting up to {self.MANUAL_CAPTCHA_TIMEOUT_SEC:.0f}s "
+      "for captcha solve (do not close the tab)"
+    )
 
+    started_at = time.time()
     last_heartbeat = time.time()
     last_closed_notice = 0.0
     while True:
       if stop_event and stop_event.is_set():
         self._log("[Captcha] Manual wait cancelled by stop signal")
         return "stopped"
+
+      if time.time() - started_at >= self.MANUAL_CAPTCHA_TIMEOUT_SEC:
+        self._log(
+          f"[Captcha] Manual wait timed out after {self.MANUAL_CAPTCHA_TIMEOUT_SEC:.0f}s "
+          "— profile will be removed"
+        )
+        self._log_captcha_event(
+          "manual_timeout",
+          captcha_type or "unknown",
+        )
+        self._awaiting_clear = False
+        return "blocked"
 
       if page.is_closed():
         if time.time() - last_closed_notice >= 15.0:
@@ -690,7 +861,7 @@ class CaptchaSolver:
   def _wait_for_captcha_meta(
     self,
     page: Page,
-    timeout_sec: float = 12.0,
+    timeout_sec: float = 6.0,
   ) -> tuple[Optional[str], str, Optional[str], Optional[str], bool]:
     deadline = time.time() + timeout_sec
     attempt = 0
@@ -704,12 +875,12 @@ class CaptchaSolver:
       try:
         page.wait_for_selector(
           '#recaptcha, .g-recaptcha, [data-sitekey], iframe[src*="recaptcha"], #captcha-form',
-          timeout=1500,
+          timeout=1000,
           state="attached",
         )
       except Exception:
         pass
-      page.wait_for_timeout(500)
+      page.wait_for_timeout(300)
     return self._extract_captcha_meta(page)
 
   def _extract_captcha_meta(
@@ -764,17 +935,21 @@ class CaptchaSolver:
     return sitekey, "ReCaptchaV2TaskProxyLess", None, meta.get("callbackName"), is_google
 
   @staticmethod
+  def _google_sorry_base_url() -> str:
+    return "https://www.google.com/sorry/index"
+
+  @staticmethod
   def _normalize_website_url(page_url: str, *, is_google: bool) -> str:
     raw = (page_url or "").strip()
     if not raw:
-      return "https://www.google.com/sorry/index"
+      return CaptchaSolver._google_sorry_base_url()
     parsed = urlparse(raw)
     host = (parsed.netloc or "").lower()
     path = (parsed.path or "").lower()
     if is_google or "google." in host:
       if "/sorry/" in path:
-        return raw.split("#", 1)[0]
-      return "https://www.google.com/sorry/index"
+        return CaptchaSolver._google_sorry_base_url()
+      return CaptchaSolver._google_sorry_base_url()
     return raw.split("#", 1)[0]
 
   def _build_task_variants(
@@ -785,35 +960,124 @@ class CaptchaSolver:
     *,
     enterprise_s: Optional[str],
     is_google: bool,
+    proxy: Optional[str] = None,
+    raw_page_url: str = "",
   ) -> list[dict]:
-    base: dict = {
-      "websiteURL": page_url,
-      "websiteKey": sitekey,
-    }
+    if captcha_type == "ReCaptchaV3TaskProxyLess":
+      return [{
+        "type": "ReCaptchaV3TaskProxyLess",
+        "websiteURL": page_url or self._google_sorry_base_url(),
+        "websiteKey": sitekey,
+        "pageAction": "verify",
+      }]
+
+    website_urls: list[str] = []
+    base_url = self._google_sorry_base_url()
+    full = (raw_page_url or page_url or "").strip().split("#", 1)[0]
     if is_google:
-      base["apiDomain"] = "www.google.com"
+      website_urls.append(base_url)
+      if full and full != base_url and "/sorry/" in full.lower():
+        website_urls.append(full)
+    else:
+      website_urls.append(page_url or base_url)
+
+    is_enterprise = bool(
+      is_google
+      or enterprise_s
+      or "Enterprise" in captcha_type
+      or captcha_type == "recaptcha_enterprise"
+    )
+    proxy_value = (proxy or self._proxy_capsolver or "").strip()
+    use_proxy = bool(proxy_value) and not self._proxy_capsolver_unusable
 
     variants: list[dict] = []
+    seen: set[str] = set()
 
-    def add_variant(task_type: str, *, enterprise: bool = False) -> None:
-      task = {"type": task_type, **base}
-      if task_type.startswith("ReCaptchaV3"):
-        task["pageAction"] = "verify"
-      if enterprise_s:
-        if enterprise or "Enterprise" in task_type:
-          task["enterprisePayload"] = {"s": enterprise_s}
-        else:
-          task["recaptchaDataSValue"] = enterprise_s
+    def add_variant(
+      task_type: str,
+      url: str,
+      *,
+      enterprise: bool = False,
+      invisible: Optional[bool] = None,
+      with_proxy: bool = False,
+    ) -> None:
+      task: dict = {
+        "type": task_type,
+        "websiteURL": url,
+        "websiteKey": sitekey,
+      }
+      if is_google:
+        task["apiDomain"] = "www.google.com"
+      if invisible is True:
+        task["isInvisible"] = True
+      if enterprise_s and (enterprise or "Enterprise" in task_type):
+        task["enterprisePayload"] = {"s": enterprise_s}
+      elif enterprise_s and not enterprise and "Enterprise" not in task_type:
+        task["recaptchaDataSValue"] = enterprise_s
+      if with_proxy and proxy_value:
+        task["proxy"] = proxy_value
+      signature = json.dumps(task, sort_keys=True)
+      if signature in seen:
+        return
+      seen.add(signature)
       variants.append(task)
 
-    if captcha_type == "ReCaptchaV3TaskProxyLess":
-      add_variant("ReCaptchaV3TaskProxyLess")
+    if is_google and is_enterprise:
+      # Proxyless Google enterprise is rejected by CapSolver; proxy+visible works.
+      if use_proxy:
+        add_variant(
+          "ReCaptchaV2EnterpriseTask",
+          website_urls[0],
+          enterprise=True,
+          invisible=False,
+          with_proxy=True,
+        )
+        if len(website_urls) > 1:
+          add_variant(
+            "ReCaptchaV2EnterpriseTask",
+            website_urls[1],
+            enterprise=True,
+            invisible=False,
+            with_proxy=True,
+          )
+        add_variant(
+          "ReCaptchaV2EnterpriseTask",
+          website_urls[0],
+          enterprise=True,
+          invisible=True,
+          with_proxy=True,
+        )
       return variants
 
-    add_variant("ReCaptchaV2EnterpriseTaskProxyLess", enterprise=True)
-    if enterprise_s:
-      add_variant("ReCaptchaV2TaskProxyLess")
+    for url in website_urls:
+      add_variant(
+        "ReCaptchaV2EnterpriseTaskProxyLess",
+        url,
+        enterprise=True,
+        invisible=False,
+      )
+      if use_proxy:
+        add_variant(
+          "ReCaptchaV2EnterpriseTask",
+          url,
+          enterprise=True,
+          invisible=False,
+          with_proxy=True,
+        )
+
+    if not is_enterprise:
+      add_variant(
+        "ReCaptchaV2TaskProxyLess",
+        website_urls[0],
+        invisible=False,
+      )
+
     return variants
+
+  @staticmethod
+  def _is_proxy_connect_error(code: str, desc: str) -> bool:
+    text = f"{code} {desc}".upper()
+    return "PROXY_CONNECT" in text or "PROXY" in text and "CONNECT" in text
 
   def _fetch_token(
     self,
@@ -824,63 +1088,94 @@ class CaptchaSolver:
     enterprise_s: Optional[str] = None,
     is_google: bool = False,
     timeout: int = 120,
+    raw_page_url: str = "",
   ) -> Optional[str]:
+    self._last_api_error = ""
+    deadline = time.time() + max(30, int(timeout))
     variants = self._build_task_variants(
       page_url,
       sitekey,
       captcha_type,
       enterprise_s=enterprise_s,
       is_google=is_google,
+      proxy=self._proxy_capsolver or None,
+      raw_page_url=raw_page_url,
     )
-    per_variant_timeout = max(30, timeout // max(1, len(variants)))
+    if not variants:
+      self.logger("[CapSolver] No task variants available for this captcha")
+      return None
 
     for index, task in enumerate(variants, start=1):
+      remaining = max(25, int(deadline - time.time()))
+      if remaining <= 8:
+        self.logger("[CapSolver] Solve window exhausted before trying more variants")
+        break
+      if task.get("proxy") and self._proxy_capsolver_unusable:
+        continue
       task_type = task.get("type", "")
+      task_url = task.get("websiteURL", page_url)
+      flags = ["visible" if not task.get("isInvisible") else "invisible"]
+      if task.get("enterprisePayload"):
+        flags.append("data-s")
+      if task.get("proxy"):
+        flags.append("proxy")
+      flag_text = ", ".join(flags)
       self.logger(
         "[CapSolver] Sending createTask to api.capsolver.com "
-        f"(variant {index}/{len(variants)}, type={task_type}, websiteURL={page_url}, "
-        f"websiteKey={sitekey[:10]}..."
-        + (", data-s set)" if enterprise_s else ")")
+        f"(variant {index}/{len(variants)}, type={task_type}, websiteURL={task_url}, "
+        f"websiteKey={sitekey}, {flag_text}, budget={remaining}s)"
       )
-      token = self._create_and_poll_task(task, timeout=per_variant_timeout)
+      token, create_error = self._create_and_poll_task(task, timeout=remaining)
       if token:
         return token
+      if create_error and self._is_proxy_connect_error(
+        create_error.get("code", ""),
+        create_error.get("desc", ""),
+      ):
+        self._proxy_capsolver_unusable = True
+        self.logger("[CapSolver] Proxy rejected by CapSolver — skipping further proxy variants")
       self.logger(f"[CapSolver] Variant {index} ({task_type}) did not return a token")
 
     return None
 
-  def _create_and_poll_task(self, task: dict, *, timeout: int) -> Optional[str]:
+  def _create_and_poll_task(self, task: dict, *, timeout: int) -> tuple[Optional[str], Optional[dict]]:
     create_response = self._post_json(
       self.CREATE_URL,
       {"clientKey": self.api_key, "task": task},
     )
     if self._capsolver_error(create_response):
+      code = create_response.get("errorCode") or ""
+      desc = create_response.get("errorDescription") or ""
+      self._last_api_error = f"{code}: {desc}".strip(": ").strip() or "createTask rejected"
       self.logger(
         f"[CapSolver] createTask error: errorId={create_response.get('errorId')} "
-        f"code={create_response.get('errorCode')} desc={create_response.get('errorDescription')}"
+        f"code={code} desc={desc}"
       )
-      return None
+      return None, {"code": code, "desc": desc, "stage": "createTask"}
 
     task_id = create_response.get("taskId")
     if not task_id:
       self.logger(f"[CapSolver] createTask missing taskId: {create_response}")
-      return None
+      return None, {"code": "", "desc": "missing taskId", "stage": "createTask"}
 
     self.logger(f"[CapSolver] createTask accepted by CapSolver: taskId={task_id}")
-    deadline = time.time() + timeout
+    poll_deadline = time.time() + timeout
     poll_count = 0
-    while time.time() < deadline:
+    while time.time() < poll_deadline:
       poll_count += 1
       result = self._post_json(
         self.RESULT_URL,
         {"clientKey": self.api_key, "taskId": task_id},
       )
       if self._capsolver_error(result):
+        code = result.get("errorCode") or ""
+        desc = result.get("errorDescription") or ""
+        self._last_api_error = f"{code}: {desc}".strip(": ").strip() or "getTaskResult failed"
         self.logger(
           f"[CapSolver] getTaskResult error: errorId={result.get('errorId')} "
-          f"code={result.get('errorCode')} desc={result.get('errorDescription')}"
+          f"code={code} desc={desc}"
         )
-        return None
+        return None, {"code": code, "desc": desc, "stage": "getTaskResult"}
 
       status = result.get("status")
       if poll_count == 1 or poll_count % 5 == 0:
@@ -890,13 +1185,13 @@ class CaptchaSolver:
         token = solution.get("gRecaptchaResponse") or solution.get("token")
         if token:
           self.logger("[CapSolver] Token received from CapSolver")
-          return token
+          return token, None
         self.logger(f"[CapSolver] ready response missing token: {result}")
-        return None
+        return None, {"code": "", "desc": "missing token", "stage": "getTaskResult"}
       if status == "failed":
         self.logger(f"[CapSolver] solve failed: {result}")
-        return None
-      time.sleep(2)
+        return None, {"code": "", "desc": "solve failed", "stage": "getTaskResult"}
+      time.sleep(1)
 
     self.logger("[CapSolver] solve timed out while polling getTaskResult")
-    return None
+    return None, None
