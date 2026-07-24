@@ -75,6 +75,14 @@ _PRE_DELETE_FAILURE_OUTCOMES = frozenset({
   "tunnel_error",
 })
 
+# Outcomes that emit a detailed pre-delete line; hide duplicate Target/Controller lines.
+_TERMINAL_OUTCOME_UI_DEDUP = frozenset({
+  "failed",
+  "not_found",
+  "proxy_connect_failed",
+  *_PRE_DELETE_FAILURE_OUTCOMES,
+})
+
 
 def _split_profile(message: str) -> tuple[Optional[str], str]:
   text = message.strip()
@@ -146,6 +154,8 @@ def format_user_log(message: str) -> Optional[str]:
     finished = re.search(r"\[Controller\]\s+(\S+)\s+finished\s+\(([^)]+)\)", raw)
     if finished:
       name, outcome = finished.group(1), finished.group(2)
+      if outcome in _TERMINAL_OUTCOME_UI_DEDUP:
+        return None
       return _fmt(name, _outcome_label(outcome))
     return None
 
@@ -275,10 +285,8 @@ def format_user_log(message: str) -> Optional[str]:
     return _fmt(profile, "VisitingSite")
 
   if tag == "Target" and "Failed open target site" in payload:
-    failed_open_target = _FAILED_OPEN_TARGET.search(payload)
-    if failed_open_target and profile:
-      keyword, site = failed_open_target.group(1).strip(), failed_open_target.group(2).strip()
-      return _fmt(profile, f"Failed open target site ({keyword} : {site})")
+    # Worker pre-delete line is the single UI message for this outcome.
+    return None
 
   if body.startswith("No keywords configured"):
     return _fmt(profile, "Failed - no keywords configured")
@@ -306,9 +314,6 @@ def format_user_log(message: str) -> Optional[str]:
 
   failed_open_target = _FAILED_OPEN_TARGET.search(body)
   if failed_open_target and profile:
-    # Worker pre-delete line duplicates the earlier [Target] failure message.
-    if body.lower().startswith("failed open target site"):
-      return None
     keyword, site = failed_open_target.group(1).strip(), failed_open_target.group(2).strip()
     return _fmt(profile, f"Failed open target site ({keyword} : {site})")
 

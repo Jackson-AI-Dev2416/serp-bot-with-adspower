@@ -141,6 +141,10 @@ QLabel#kpiValue {
   font-weight: 700;
   color: #F8FAFC;
 }
+QLabel#kpiTrafficValue {
+  font-weight: 700;
+  color: #F8FAFC;
+}
 QFrame#panelCard {
   background-color: #151B2B;
   border: 1px solid #263044;
@@ -942,11 +946,12 @@ class UiMainWindow(QMainWindow):
         "Before target open = other; after successful click/touch = site."
       ),
     )
-    self.proxy_traffic_total_label.setText("0 B")
+    self._configure_traffic_rich_label(self.proxy_traffic_total_label, pixel_size=26)
+    self.proxy_traffic_total_label.setText(self._format_traffic_total_display())
     cycle_card, self.present_cycle_value_label = make_kpi_card("Current Session")
     self.present_cycle_value_label.setText("0 / 0")
     clicks_card, self.overall_clicks_value_label = make_kpi_card("Total Clicks")
-    self.overall_clicks_value_label.setText("0 / 0")
+    self.overall_clicks_value_label.setText(self._format_overall_clicks_kpi(0, 0))
     active_card, self.captcha_occurs_value_label = make_kpi_card("Captcha Occurs")
     self.captcha_occurs_value_label.setText("0 / 0")
     for card in (elapsed_card, traffic_card, cycle_card, clicks_card, active_card):
@@ -1460,6 +1465,7 @@ class UiMainWindow(QMainWindow):
     )
     self.result_traffic_value = QLabel("0 B")
     self.result_traffic_value.setObjectName("trafficTotalValue")
+    self._configure_traffic_rich_label(self.result_traffic_value, pixel_size=24)
     traffic_box.addWidget(traffic_title, alignment=Qt.AlignmentFlag.AlignRight)
     traffic_box.addWidget(self.result_traffic_value, alignment=Qt.AlignmentFlag.AlignRight)
 
@@ -1636,7 +1642,9 @@ class UiMainWindow(QMainWindow):
 
   def _clear_result_session_view(self) -> None:
     self.result_total_clicks_value.setText("0")
-    self.result_traffic_value.setText("0 B")
+    self.result_traffic_value.setText(
+      self._format_bytes_html(0, integer_units=True, number_pixel_size=24),
+    )
     self.result_not_found_value.setText("0")
     self._result_loaded_path = None
     self._result_loaded_headers = []
@@ -1670,7 +1678,11 @@ class UiMainWindow(QMainWindow):
     active_path = (self._session_click_log_path or "").strip()
     if active_path and Path(active_path).resolve() == path.resolve():
       traffic_bytes = max(traffic_bytes, self._controller.get_session_traffic_total())
-    self.result_traffic_value.setText(self._format_bytes(traffic_bytes))
+    self.result_traffic_value.setText(
+      self._format_bytes_html(
+        traffic_bytes, integer_units=True, number_pixel_size=24,
+      ),
+    )
 
     self.result_not_found_value.setText("0")
     self._rebuild_result_domain_buttons()
@@ -2579,16 +2591,29 @@ class UiMainWindow(QMainWindow):
 
   def _reset_overall_clicks(self) -> None:
     self._overall_clicks_session = 0
-    self.overall_clicks_value_label.setText("0 / 0")
+    self.overall_clicks_value_label.setText(self._format_overall_clicks_kpi(0, 0))
+
+  @staticmethod
+  def _format_overall_clicks_kpi(successes: int, failures: int) -> str:
+    successes = max(0, int(successes))
+    failures = max(0, int(failures))
+    total = successes + failures
+    if total <= 0:
+      rate_pct = 0
+    else:
+      rate_pct = int(round((successes / total) * 100.0))
+    return f"{successes} / {failures} / {rate_pct}%"
 
   def _refresh_overall_clicks_kpi(self) -> None:
     path = (self._session_click_log_path or "").strip()
     if not path:
-      self.overall_clicks_value_label.setText("0 / 0")
+      self.overall_clicks_value_label.setText(self._format_overall_clicks_kpi(0, 0))
       return
     successes, failures = count_session_click_outcomes(path)
     self._overall_clicks_session = successes
-    self.overall_clicks_value_label.setText(f"{successes} / {failures}")
+    self.overall_clicks_value_label.setText(
+      self._format_overall_clicks_kpi(successes, failures),
+    )
 
   def _refresh_overall_clicks(self) -> None:
     self._refresh_overall_clicks_kpi()
@@ -2892,25 +2917,88 @@ class UiMainWindow(QMainWindow):
     )
 
   @staticmethod
-  def _format_bytes(total_bytes: int, *, integer_units: bool = False) -> str:
+  def _configure_traffic_rich_label(label: QLabel, *, pixel_size: int = 26) -> None:
+    label.setObjectName("kpiTrafficValue")
+    label.setTextFormat(Qt.TextFormat.RichText)
+    font = QFont(label.font())
+    font.setPixelSize(max(10, int(pixel_size)))
+    font.setWeight(QFont.Weight.Bold)
+    label.setFont(font)
+
+  @staticmethod
+  def _traffic_unit_font_px(number_pixel_size: int) -> int:
+    return max(8, int(round(max(10, int(number_pixel_size)) * 0.5)))
+
+  @staticmethod
+  def _traffic_rich_number(text: str, *, pixel_size: int) -> str:
+    px = max(10, int(pixel_size))
+    return f'<span style="font-size:{px}px; font-weight:700;">{text}</span>'
+
+  @staticmethod
+  def _traffic_rich_unit(unit: str, *, number_pixel_size: int) -> str:
+    unit_px = UiMainWindow._traffic_unit_font_px(number_pixel_size)
+    return f'<span style="font-size:{unit_px}px; font-weight:700;"> {unit}</span>'
+
+  @staticmethod
+  def _bytes_amount_parts(
+    total_bytes: int,
+    *,
+    integer_units: bool = False,
+  ) -> tuple[str, str]:
     value = max(0, int(total_bytes))
     if value < 1024:
-      return f"{value} B"
+      return str(value), "B"
     kb = value / 1024.0
     if kb < 1024.0:
       if integer_units:
-        return f"{int(round(kb))} KB"
-      return f"{kb:.2f} KB"
+        return str(int(round(kb))), "KB"
+      return f"{kb:.2f}", "KB"
     mb = value / (1024.0 * 1024.0)
     if integer_units:
-      return f"{int(round(mb))} MB"
-    return f"{mb:.2f} MB"
+      return str(int(round(mb))), "MB"
+    return f"{mb:.2f}", "MB"
 
-  def _format_traffic_total_display(self) -> str:
-    total = self._format_bytes(self._session_traffic_total, integer_units=True)
-    target = self._format_bytes(self._session_target_traffic, integer_units=True)
-    other = self._format_bytes(self._session_other_traffic, integer_units=True)
-    return f"{total} ({target} / {other})"
+  @staticmethod
+  def _format_bytes(total_bytes: int, *, integer_units: bool = False) -> str:
+    number, unit = UiMainWindow._bytes_amount_parts(
+      total_bytes, integer_units=integer_units,
+    )
+    return f"{number} {unit}"
+
+  @staticmethod
+  def _format_bytes_html(
+    total_bytes: int,
+    *,
+    integer_units: bool = False,
+    number_pixel_size: int = 26,
+  ) -> str:
+    number, unit = UiMainWindow._bytes_amount_parts(
+      total_bytes, integer_units=integer_units,
+    )
+    return (
+      UiMainWindow._traffic_rich_number(number, pixel_size=number_pixel_size)
+      + UiMainWindow._traffic_rich_unit(unit, number_pixel_size=number_pixel_size)
+    )
+
+  def _format_traffic_total_display(self, *, number_pixel_size: int = 26) -> str:
+    rich = UiMainWindow._traffic_rich_number
+    total = self._format_bytes_html(
+      self._session_traffic_total, integer_units=True, number_pixel_size=number_pixel_size,
+    )
+    target = self._format_bytes_html(
+      self._session_target_traffic, integer_units=True, number_pixel_size=number_pixel_size,
+    )
+    other = self._format_bytes_html(
+      self._session_other_traffic, integer_units=True, number_pixel_size=number_pixel_size,
+    )
+    return (
+      f"{total}"
+      f"{rich(' (', pixel_size=number_pixel_size)}"
+      f"{target}"
+      f"{rich(' / ', pixel_size=number_pixel_size)}"
+      f"{other}"
+      f"{rich(')', pixel_size=number_pixel_size)}"
+    )
 
   def _on_proxy_traffic_update(self, proxy_key: str, total_bytes: int) -> None:
     _ = proxy_key

@@ -36,7 +36,9 @@ def test_format_user_log_error_blocked():
 
 def test_format_user_log_failed_open_target_site():
   internal = "[s-008] failed open target site: '춘천출장마사지' → kingdomanma.com"
-  assert format_user_log(internal) is None
+  assert format_user_log(internal) == (
+    "[s-008] Failed open target site (춘천출장마사지 : kingdomanma.com)"
+  )
 
 
 def test_format_user_log_failed_open_delete_flow():
@@ -46,27 +48,33 @@ def test_format_user_log_failed_open_delete_flow():
   pre_delete = format_user_log(
     "[s-008] failed open target site: '춘천출장마사지' → kingdomanma.com"
   )
+  controller = format_user_log(
+    "[Controller] s-008 finished (failed), proxy cooldown started"
+  )
   deleted = format_user_log(
     "[Worker] Deleted profile s-008 after run (failed); proxy entry kept."
   )
-  assert target == "[s-008] Failed open target site (춘천출장마사지 : kingdomanma.com)"
-  assert pre_delete is None
+  assert target is None
+  assert pre_delete == "[s-008] Failed open target site (춘천출장마사지 : kingdomanma.com)"
+  assert controller is None
   assert deleted == "[s-008] Finished - profile removed"
 
 
 def test_format_user_log_target_click_failure_message():
   internal = "[s-009] [Target] Failed open target site: '춘천출장마사지' → kingdomanma.com"
-  assert format_user_log(internal) == (
-    "[s-009] Failed open target site (춘천출장마사지 : kingdomanma.com)"
-  )
+  assert format_user_log(internal) is None
 
 
 def test_format_user_log_delete_follows_not_found():
   not_found = format_user_log(
     "[s-006] not found target site: '영월출장안마' → kingdomanma.com"
   )
+  controller = format_user_log(
+    "[Controller] s-006 finished (not_found), proxy cooldown started"
+  )
   deleted = format_user_log("[Worker] Deleted profile s-006 after run (not_found); proxy entry kept.")
   assert not_found == "[s-006] Not found target site (영월출장안마 : kingdomanma.com)"
+  assert controller is None
   assert deleted == "[s-006] Finished - profile removed"
 
 

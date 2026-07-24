@@ -5427,7 +5427,7 @@ class SerpBot:
 
       if hunt_found and page_clicks == 0:
         self._last_target_open_failed = True
-        self.logger(
+        log(
           f"[Target] Failed open target site: '{keyword}' → {self._session_target_domain}"
         )
         break

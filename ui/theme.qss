@@ -60,6 +60,10 @@ QLabel#kpiValue {
   font-weight: 700;
   color: #F8FAFC;
 }
+QLabel#kpiTrafficValue {
+  font-weight: 700;
+  color: #F8FAFC;
+}
 QFrame#panelCard {
   background-color: #151B2B;
   border: 1px solid #263044;
